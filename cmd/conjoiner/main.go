@@ -16,10 +16,7 @@ import (
 	"github.com/bonjoski/conjoiner/pkg/gateway"
 	"github.com/bonjoski/conjoiner/pkg/mandate"
 	"github.com/bonjoski/conjoiner/pkg/token"
-)
-
-const (
-	Version = "0.1.0-alpha"
+	"github.com/bonjoski/conjoiner/pkg/version"
 )
 
 // RootKeyStorage stores or simulates local broker signing key.
@@ -90,7 +87,7 @@ func main() {
 	case "mandate":
 		handleMandateCommand(os.Args[2:])
 	case "version":
-		fmt.Printf("conjoiner version %s (Go NIST Agentic IAM Broker)\n", Version)
+		fmt.Printf("conjoiner version %s (Go NIST Agentic IAM Broker)\n", version.Version)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", os.Args[1])
 		printUsage()
