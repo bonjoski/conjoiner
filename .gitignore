@@ -1,0 +1,15 @@
+# Binaries
+bin/
+/conjoiner
+/conjoiner.exe
+*.test
+
+# Go workspace
+go.work
+go.work.sum
+
+# OS
+.DS_Store
+*.swp
+*.swo
+*~
