@@ -1,0 +1,21 @@
+# Conjoiner
+
+> Sovereign Agentic IAM Broker & Policy Gateway (NIST SP 800-207A Non-Human Identity).
+
+## Core Capabilities
+- NIST SP 800-207A Compliance: Implements the 10 Design Tenets for Agentic Non-Human Identity (NHI).
+- IETF RFC 8693 Token Exchange: Exchanges parent agent identity for short-lived, task-bound child tokens.
+- IETF RFC 9449 DPoP Binding: Binds ephemeral tokens to agent-generated Ed25519 keypairs, eliminating bearer token theft.
+- Ephemeral Lifespans: Enforces strict default 30-second TTL (hard 60-second ceiling).
+- Monotonic Scope Attenuation: Enforces `ChildScope = ParentScope ∩ RequestedScope` via monotonic delegation chains.
+- Deterministic Policy Gateway: Separates probabilistic prompt reasoning from tool execution.
+
+## CLI Usage
+- `conjoiner issue --subject <name> --scope <scopes> --ttl 30s`: Issues an ephemeral root token.
+- `conjoiner attenuate --parent-token <token> --child-id <id> --requested-scope <scopes>`: Attenuates scopes for a sub-agent.
+- `conjoiner verify --token <token> --dpop-proof <proof>`: Validates DPoP binding and TTL.
+- `conjoiner exec --token <token> --dpop-proof <proof> -- <tool_command>`: Executes tool atomically through policy gateway.
+
+## Sockets & Documentation
+- Daemon Socket: `~/.conjoiner/conjoiner.sock`
+- Documentation: `docs/knowledge-base/07-conjoiner.md` in repo `spanreed`
