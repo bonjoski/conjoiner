@@ -1,6 +1,5 @@
 # Claude Code Guidelines for `conjoiner`
 
-> **Authoritative Ecosystem Runbook:** [`spanreed/docs/knowledge-base/07-conjoiner.md`](file:///Users/benskolmoski/code/spanreed/docs/knowledge-base/07-conjoiner.md)
 
 ## Build & Test Commands
 - **Build Binary:** `go build -o bin/conjoiner ./cmd/conjoiner`

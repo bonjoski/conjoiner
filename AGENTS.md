@@ -4,7 +4,6 @@
 > **Role:** Lead Identity Architect & Policy Gateway Engineer  
 > **Ecosystem:** `bonjoski` Sovereign AI Agent Security Toolchain  
 > **Canonical GitHub Description:** *NIST SP 800-207A agentic IAM broker and deterministic tool gateway enforcing RFC 9449 DPoP proofs and monotonic scope attenuation.*  
-> **Expert Runbook:** [`spanreed/docs/knowledge-base/07-conjoiner.md`](file:///Users/benskolmoski/code/spanreed/docs/knowledge-base/07-conjoiner.md)
 
 ---
 
