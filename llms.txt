@@ -1,21 +1,20 @@
 # Conjoiner
 
-> Sovereign Agentic IAM Broker & Policy Gateway (NIST SP 800-207A Non-Human Identity).
+> NIST SP 800-207A agentic IAM broker and deterministic tool gateway enforcing RFC 9449 DPoP proofs and monotonic scope attenuation.
 
 ## Core Capabilities
-- NIST SP 800-207A Compliance: Implements the 10 Design Tenets for Agentic Non-Human Identity (NHI).
-- IETF RFC 8693 Token Exchange: Exchanges parent agent identity for short-lived, task-bound child tokens.
-- IETF RFC 9449 DPoP Binding: Binds ephemeral tokens to agent-generated Ed25519 keypairs, eliminating bearer token theft.
-- Ephemeral Lifespans: Enforces strict default 30-second TTL (hard 60-second ceiling).
-- Monotonic Scope Attenuation: Enforces `ChildScope = ParentScope ∩ RequestedScope` via monotonic delegation chains.
-- Deterministic Policy Gateway: Separates probabilistic prompt reasoning from tool execution.
+- NIST SP 800-207A NHI Broker: Enforces the 10 Design Tenets for Agentic Non-Human Identity.
+- RFC 8693 Token Exchange: Exchanges delegating parent agent identity for task-scoped child credentials.
+- RFC 9449 Ed25519 DPoP Binding: Binds ephemeral JWTs to agent-generated keypairs (`token.cnf.jkt`).
+- Ultra-Short Ephemeral TTL: 30-second default lifetime with 60-second policy ceiling.
+- Monotonic Scope Attenuation: Mathematically guarantees $ChildScope = ParentScope \cap RequestedScope$.
+- Deterministic Policy Gateway: Executes protected tools directly to isolate credentials from probabilistic LLMs.
 
 ## CLI Usage
-- `conjoiner issue --subject <name> --scope <scopes> --ttl 30s`: Issues an ephemeral root token.
-- `conjoiner attenuate --parent-token <token> --child-id <id> --requested-scope <scopes>`: Attenuates scopes for a sub-agent.
-- `conjoiner verify --token <token> --dpop-proof <proof>`: Validates DPoP binding and TTL.
-- `conjoiner exec --token <token> --dpop-proof <proof> -- <tool_command>`: Executes tool atomically through policy gateway.
+- `conjoiner issue --subject <name> --scope <scopes>`: Issues initial root agent token.
+- `conjoiner attenuate --parent-token <jwt> --requested-scope <scopes>`: Mints attenuated sub-agent token.
+- `conjoiner verify --token <jwt> --dpop-proof <proof>`: Cryptographically verifies DPoP binding.
 
-## Sockets & Documentation
-- Daemon Socket: `~/.conjoiner/conjoiner.sock`
-- Documentation: `docs/knowledge-base/07-conjoiner.md` in repo `spanreed`
+## Key Sockets & Paths
+- Control Socket: `~/.conjoiner/conjoiner.sock`
+- Parent Runbook: `docs/knowledge-base/07-conjoiner.md` in repository `spanreed`
