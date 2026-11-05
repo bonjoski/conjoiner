@@ -9,12 +9,14 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/bonjoski/conjoiner/pkg/attenuation"
 	"github.com/bonjoski/conjoiner/pkg/gateway"
 	"github.com/bonjoski/conjoiner/pkg/mandate"
+	"github.com/bonjoski/conjoiner/pkg/mcp"
 	"github.com/bonjoski/conjoiner/pkg/token"
 	"github.com/bonjoski/conjoiner/pkg/version"
 )
@@ -72,6 +74,12 @@ func getOrGenerateBrokerKeys() (*RootKeyStorage, error) {
 }
 
 func main() {
+	exeName := filepath.Base(os.Args[0])
+	if exeName == "mcp-conjoiner-proxy" {
+		handleMCPShimCommand(os.Args[1:])
+		return
+	}
+
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(1)
@@ -86,6 +94,8 @@ func main() {
 		handleGateCommand(os.Args[2:])
 	case "mandate":
 		handleMandateCommand(os.Args[2:])
+	case "mcp-shim", "mcp-proxy":
+		handleMCPShimCommand(os.Args[2:])
 	case "version":
 		fmt.Printf("conjoiner version %s (Go NIST Agentic IAM Broker)\n", version.Version)
 	default:
@@ -100,13 +110,15 @@ func printUsage() {
 
 Usage:
   conjoiner <command> [subcommand] [flags]
+  mcp-conjoiner-proxy [--scope <scopes>] -- <target-command> [args...]
 
 Commands:
-  token    Manage, issue, attenuate, and verify task tokens
-  dpop     Manage ephemeral DPoP keypairs and proofs
-  gate     Deterministic policy gateway execution
-  mandate  Compile natural language security mandates into capability scopes
-  version  Display Conjoiner version`)
+  token     Manage, issue, attenuate, and verify task tokens
+  dpop      Manage ephemeral DPoP keypairs and proofs
+  gate      Deterministic policy gateway execution
+  mandate   Compile natural language security mandates into capability scopes
+  mcp-shim  Transparent MCP transport shim & DPoP tool gateway
+  version   Display Conjoiner version`)
 }
 
 // Token CLI subcommands
@@ -460,5 +472,65 @@ func handleMandateCompile(args []string) {
 	if res.Advisory != "" {
 		fmt.Println("\n[Shield Protected AI Advisory]")
 		fmt.Println(res.Advisory)
+	}
+}
+
+// MCP Shim & Proxy CLI subcommands
+func handleMCPShimCommand(args []string) {
+	shimCmd := flag.NewFlagSet("mcp-shim", flag.ExitOnError)
+	scopeFlag := shimCmd.String("scope", "", "Comma-separated allowed scopes (default: ambient CONJOINER_SCOPES or allow-all)")
+	noRedactFlag := shimCmd.Bool("no-redact", false, "Disable Shield secret output redaction")
+
+	// Find "--" delimiter separating flags from target command
+	var targetArgs []string
+	flagArgs := args
+	for i, a := range args {
+		if a == "--" {
+			flagArgs = args[:i]
+			if i+1 < len(args) {
+				targetArgs = args[i+1:]
+			}
+			break
+		}
+	}
+
+	if err := shimCmd.Parse(flagArgs); err != nil {
+		fmt.Fprintf(os.Stderr, "flag parse error: %v\n", err)
+		os.Exit(1)
+	}
+
+	// If targetArgs was not separated by "--", check remaining positional args
+	if len(targetArgs) == 0 {
+		targetArgs = shimCmd.Args()
+	}
+
+	if len(targetArgs) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: conjoiner mcp-shim [--scope <scopes>] -- <target-command> [args...]")
+		fmt.Fprintln(os.Stderr, "   or: mcp-conjoiner-proxy [--scope <scopes>] -- <target-command> [args...]")
+		os.Exit(1)
+	}
+
+	var allowedScopes []string
+	if *scopeFlag != "" {
+		allowedScopes = strings.Split(*scopeFlag, ",")
+	}
+
+	cfg := mcp.Config{
+		TargetCommand: targetArgs[0],
+		TargetArgs:    targetArgs[1:],
+		AllowedScopes: allowedScopes,
+		ScrubSecrets:  !*noRedactFlag,
+	}
+
+	shim, err := mcp.NewTransportShim(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialize MCP shim: %v\n", err)
+		os.Exit(1)
+	}
+
+	ctx := context.Background()
+	if err := shim.Run(ctx, os.Stdin, os.Stdout, os.Stderr); err != nil && !errors.Is(err, context.Canceled) {
+		fmt.Fprintf(os.Stderr, "MCP shim runtime error: %v\n", err)
+		os.Exit(1)
 	}
 }
