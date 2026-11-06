@@ -92,12 +92,18 @@ func main() {
 		handleDPoPCommand(os.Args[2:])
 	case "gate":
 		handleGateCommand(os.Args[2:])
+	case "run", "exec":
+		handleGateCommand(append([]string{"exec"}, os.Args[2:]...))
 	case "mandate":
 		handleMandateCommand(os.Args[2:])
 	case "mcp-shim", "mcp-proxy":
 		handleMCPShimCommand(os.Args[2:])
-	case "version":
+	case "version", "--version", "-v":
 		fmt.Printf("conjoiner version %s (Go NIST Agentic IAM Broker)\n", version.Version)
+		os.Exit(0)
+	case "help", "--help", "-h":
+		printUsage()
+		os.Exit(0)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", os.Args[1])
 		printUsage()
@@ -113,6 +119,7 @@ Usage:
   mcp-conjoiner-proxy [--scope <scopes>] -- <target-command> [args...]
 
 Commands:
+  run       Run a command deterministically through the policy gate (alias for gate exec)
   token     Manage, issue, attenuate, and verify task tokens
   dpop      Manage ephemeral DPoP keypairs and proofs
   gate      Deterministic policy gateway execution
