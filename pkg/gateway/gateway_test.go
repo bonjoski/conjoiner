@@ -308,8 +308,11 @@ func TestGatewayLedgerReceiptEmission(t *testing.T) {
 	dpopKey, _ := token.GenerateDPoPKey()
 	ctx := context.Background()
 
+	sessionID := "session-cil-test"
+
 	_, tokenJWT, err := broker.IssueRootToken(ctx, token.RootTokenRequest{
 		Subject:        "agent-cil-01",
+		SessionID:      sessionID,
 		Scopes:         []string{"tool:exec:git:status"},
 		TTL:            30 * time.Second,
 		DPoPThumbprint: dpopKey.Thumbprint(),
@@ -339,7 +342,6 @@ func TestGatewayLedgerReceiptEmission(t *testing.T) {
 	}
 
 	proof, _ := dpopKey.CreateProof("EXEC", "tool://git", tokenJWT)
-	sessionID := "session-cil-test"
 
 	resp, err := gw.Execute(ctx, ToolInvocationRequest{
 		Token:     tokenJWT,
@@ -391,8 +393,11 @@ func TestGatewayLedgerRejectionProofEmissionAndFailClosed(t *testing.T) {
 	dpopKey, _ := token.GenerateDPoPKey()
 	ctx := context.Background()
 
+	sessionID := "session-rejection-test"
+
 	_, tokenJWT, _ := broker.IssueRootToken(ctx, token.RootTokenRequest{
 		Subject:        "agent-drift-attacker",
+		SessionID:      sessionID,
 		Scopes:         []string{"tool:exec:git:status"},
 		TTL:            30 * time.Second,
 		DPoPThumbprint: dpopKey.Thumbprint(),
@@ -411,8 +416,6 @@ func TestGatewayLedgerRejectionProofEmissionAndFailClosed(t *testing.T) {
 		ReplayCache:  broker.ReplayCache(),
 		Executor:     mockExec,
 	})
-
-	sessionID := "session-rejection-test"
 
 	// 1. Out-of-scope mutation -> triggers DENY_SCOPE rejection proof
 	proof1, _ := dpopKey.CreateProof("EXEC", "tool://git", tokenJWT)
@@ -506,8 +509,11 @@ func TestGatewayPersistentLedgerAudit(t *testing.T) {
 	dpopKey, _ := token.GenerateDPoPKey()
 	ctx := context.Background()
 
+	sessionID := "persistent-worktree-session"
+
 	_, tokenJWT, _ := broker.IssueRootToken(ctx, token.RootTokenRequest{
 		Subject:        "agent-persisted",
+		SessionID:      sessionID,
 		Scopes:         []string{"tool:exec:git:status"},
 		TTL:            30 * time.Second,
 		DPoPThumbprint: dpopKey.Thumbprint(),
@@ -524,7 +530,6 @@ func TestGatewayPersistentLedgerAudit(t *testing.T) {
 		Ledger: fileLedger,
 	})
 
-	sessionID := "persistent-worktree-session"
 	proof, _ := dpopKey.CreateProof("EXEC", "tool://git", tokenJWT)
 
 	_, err = gw.Execute(ctx, ToolInvocationRequest{

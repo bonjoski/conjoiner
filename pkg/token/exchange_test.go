@@ -107,18 +107,23 @@ func TestTokenExchangeAttenuationAndBinding(t *testing.T) {
 		t.Fatalf("failed issuing root token: %v", err)
 	}
 
+	parentProof1, err := parentDPoP.CreateProof("POST", "https://broker.local/exchange", rootTokenJWT)
+	if err != nil {
+		t.Fatalf("failed creating parent dpop proof: %v", err)
+	}
 	childProof, err := childDPoP.CreateProof("POST", "https://broker.local/exchange", "")
 	if err != nil {
 		t.Fatalf("failed creating child dpop proof: %v", err)
 	}
 
-	// 1. Success case: child requests valid subset
+	// 1. Success case: child requests valid subset with parent PoP
 	resp, childToken, err := broker.ExchangeToken(ctx, TokenExchangeRequest{
 		GrantType:        GrantTypeTokenExchange,
 		SubjectToken:     rootTokenJWT,
 		SubjectTokenType: TokenTypeAccessToken,
 		Scope:            []string{"fs:read:/tmp/workspace/pkg"},
 		DPoPProof:        childProof,
+		ParentDPoPProof:  parentProof1,
 		ExchangeURI:      "https://broker.local/exchange",
 	})
 	if err != nil {
@@ -128,8 +133,8 @@ func TestTokenExchangeAttenuationAndBinding(t *testing.T) {
 	if resp.TokenType != "DPoP" {
 		t.Errorf("expected token_type DPoP, got %s", resp.TokenType)
 	}
-	if resp.ExpiresIn != 30 {
-		t.Errorf("expected 30s expires_in, got %d", resp.ExpiresIn)
+	if resp.ExpiresIn <= 0 || resp.ExpiresIn > 30 {
+		t.Errorf("expected expires_in in (0, 30], got %d", resp.ExpiresIn)
 	}
 
 	// Check child token DPoP binding
@@ -142,6 +147,7 @@ func TestTokenExchangeAttenuationAndBinding(t *testing.T) {
 	}
 
 	// 2. Superset denial case: child requests privilege expansion (fs:write)
+	parentProof2, _ := parentDPoP.CreateProof("POST", "https://broker.local/exchange", rootTokenJWT)
 	childProof2, _ := childDPoP.CreateProof("POST", "https://broker.local/exchange", "")
 	_, _, err = broker.ExchangeToken(ctx, TokenExchangeRequest{
 		GrantType:        GrantTypeTokenExchange,
@@ -149,6 +155,7 @@ func TestTokenExchangeAttenuationAndBinding(t *testing.T) {
 		SubjectTokenType: TokenTypeAccessToken,
 		Scope:            []string{"fs:write:/tmp/workspace"}, // Parent is read only
 		DPoPProof:        childProof2,
+		ParentDPoPProof:  parentProof2,
 		ExchangeURI:      "https://broker.local/exchange",
 	})
 	if err == nil {
@@ -159,6 +166,7 @@ func TestTokenExchangeAttenuationAndBinding(t *testing.T) {
 	}
 
 	// 3. TTL too large (>60s)
+	parentProof3, _ := parentDPoP.CreateProof("POST", "https://broker.local/exchange", rootTokenJWT)
 	childProof3, _ := childDPoP.CreateProof("POST", "https://broker.local/exchange", "")
 	_, _, err = broker.ExchangeToken(ctx, TokenExchangeRequest{
 		GrantType:        GrantTypeTokenExchange,
@@ -167,6 +175,7 @@ func TestTokenExchangeAttenuationAndBinding(t *testing.T) {
 		Scope:            []string{"fs:read:/tmp/workspace/pkg"},
 		TTL:              120 * time.Second,
 		DPoPProof:        childProof3,
+		ParentDPoPProof:  parentProof3,
 		ExchangeURI:      "https://broker.local/exchange",
 	})
 	if err == nil || !errors.Is(err, ErrTTLTooLarge) {

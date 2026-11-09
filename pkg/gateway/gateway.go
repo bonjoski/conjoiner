@@ -131,14 +131,16 @@ func (g *Gateway) Execute(ctx context.Context, req ToolInvocationRequest) (*Tool
 		return nil, token.ErrDPoPBindingMismatch
 	}
 
-	// Resolve session ID
-	sessionID := req.SessionID
-	if sessionID == "" && req.Headers != nil {
-		sessionID = req.Headers["session_id"]
+	// CNJ-06: Bind audit SessionID strictly to authenticated signed token claims (sid -> sub -> jti)
+	// rather than trusting unauthenticated req.SessionID or headers.
+	sessionID := strings.TrimSpace(tok.SessionID)
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(tok.Subject)
 	}
 	if sessionID == "" {
-		sessionID = tok.Subject
+		sessionID = strings.TrimSpace(tok.JTI)
 	}
+	sessionID = ledger.SanitizeSessionID(sessionID)
 
 	// Extract Mandate signature and DPoP signature from tokens
 	mandateSig := extractJWTSignature(req.Token)

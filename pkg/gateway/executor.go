@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"strings"
 	"time"
 )
 
@@ -20,6 +22,45 @@ const (
 	// MaxOutputBytes limits stdout/stderr to 1MB to prevent memory exhaustion attacks.
 	MaxOutputBytes = 1024 * 1024
 )
+
+// syntheticPosixActions enumerates single-command POSIX utilities whose Conjoiner action verb
+// is a capability label rather than a CLI subcommand token. All other multi-action tools bind
+// execCtx.Action strictly as argv[0] before execCtx.Arguments.
+var syntheticPosixActions = map[string]map[string]bool{
+	"echo": {"print": true},
+	"cat":  {"read": true},
+}
+
+// limitedBuffer caps memory growth to maxBytes during command execution so runaway child output
+// can never OOM the host before cmd.Run() returns.
+type limitedBuffer struct {
+	buf       bytes.Buffer
+	maxBytes  int
+	truncated bool
+}
+
+func (l *limitedBuffer) Write(p []byte) (int, error) {
+	origLen := len(p)
+	remaining := l.maxBytes - l.buf.Len()
+	if remaining > 0 {
+		if len(p) > remaining {
+			_, _ = l.buf.Write(p[:remaining])
+			l.truncated = true
+		} else {
+			_, _ = l.buf.Write(p)
+		}
+	} else if origLen > 0 {
+		l.truncated = true
+	}
+	return origLen, nil
+}
+
+func (l *limitedBuffer) StringWithNotice() string {
+	if l.truncated {
+		return l.buf.String() + "\n...[OUTPUT TRUNCATED: EXCEEDED 1MB LIMIT]"
+	}
+	return l.buf.String()
+}
 
 // ExecutionContext contains the validated parameters for tool execution.
 type ExecutionContext struct {
@@ -79,22 +120,79 @@ func NewSafeLocalExecutor(binaries map[string]string, defaultTimeout time.Durati
 	}
 }
 
-// Execute executes the command safely.
+func isSyntheticAction(toolName, action string) bool {
+	if actions, ok := syntheticPosixActions[toolName]; ok {
+		return actions[action]
+	}
+	return false
+}
+
+func sanitizeExecEnv(baseEnv []string) []string {
+	allowedKeys := map[string]bool{
+		"PATH":    true,
+		"HOME":    true,
+		"USER":    true,
+		"LOGNAME": true,
+		"TMPDIR":  true,
+		"LANG":    true,
+		"TERM":    true,
+		"TZ":      true,
+	}
+	clean := make([]string, 0, 8)
+	for _, entry := range baseEnv {
+		eq := strings.IndexByte(entry, '=')
+		if eq <= 0 {
+			continue
+		}
+		key := strings.ToUpper(entry[:eq])
+		if allowedKeys[key] || strings.HasPrefix(key, "LC_") {
+			clean = append(clean, entry)
+		}
+	}
+	return clean
+}
+
+// Execute executes the command safely, binding argv strictly to execCtx.Action and bounding stdout/stderr memory.
 func (e *SafeLocalExecutor) Execute(ctx context.Context, execCtx ExecutionContext) (*ExecutionResult, error) {
 	binPath, exists := e.AllowedBinaries[execCtx.ToolName]
 	if !exists {
 		return nil, fmt.Errorf("tool '%s' is not registered in safe binary catalog", execCtx.ToolName)
 	}
 
+	action := strings.TrimSpace(execCtx.Action)
+	if strings.HasPrefix(action, "-") || strings.ContainsRune(action, '\x00') {
+		return nil, fmt.Errorf("%w: invalid execution action '%s'", ErrPolicyViolation, execCtx.Action)
+	}
+
+	// CNJ-04: Bind execution argv strictly to execCtx.Action so Action="status" can never run Arguments=["push", "--force"]
+	var argv []string
+	if action != "" && !isSyntheticAction(execCtx.ToolName, action) {
+		argv = make([]string, 0, 1+len(execCtx.Arguments))
+		argv = append(argv, action)
+		if len(execCtx.Arguments) > 0 && execCtx.Arguments[0] == action {
+			argv = append(argv, execCtx.Arguments[1:]...)
+		} else {
+			argv = append(argv, execCtx.Arguments...)
+		}
+	} else {
+		argv = append([]string(nil), execCtx.Arguments...)
+	}
+
+	if execCtx.Resource != "" && len(argv) == 0 && execCtx.ToolName == "cat" {
+		argv = append(argv, "--", execCtx.Resource)
+	}
+
 	execTimeout := e.DefaultTimeout
 	execCtxInternal, cancel := context.WithTimeout(ctx, execTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(execCtxInternal, binPath, execCtx.Arguments...)
+	cmd := exec.CommandContext(execCtxInternal, binPath, argv...)
+	cmd.Env = sanitizeExecEnv(os.Environ())
 
-	var stdoutBuf, stderrBuf bytes.Buffer
-	cmd.Stdout = &stdoutBuf
-	cmd.Stderr = &stderrBuf
+	stdoutBuf := &limitedBuffer{maxBytes: MaxOutputBytes}
+	stderrBuf := &limitedBuffer{maxBytes: MaxOutputBytes}
+	cmd.Stdout = stdoutBuf
+	cmd.Stderr = stderrBuf
 
 	start := time.Now()
 	err := cmd.Run()
@@ -112,20 +210,10 @@ func (e *SafeLocalExecutor) Execute(ctx context.Context, execCtx ExecutionContex
 		}
 	}
 
-	stdout := stdoutBuf.String()
-	if len(stdout) > MaxOutputBytes {
-		stdout = stdout[:MaxOutputBytes] + "\n...[OUTPUT TRUNCATED: EXCEEDED 1MB LIMIT]"
-	}
-
-	stderr := stderrBuf.String()
-	if len(stderr) > MaxOutputBytes {
-		stderr = stderr[:MaxOutputBytes] + "\n...[OUTPUT TRUNCATED: EXCEEDED 1MB LIMIT]"
-	}
-
 	return &ExecutionResult{
 		ExitCode: exitCode,
-		Stdout:   stdout,
-		Stderr:   stderr,
+		Stdout:   stdoutBuf.StringWithNotice(),
+		Stderr:   stderrBuf.StringWithNotice(),
 		Duration: duration,
 	}, nil
 }

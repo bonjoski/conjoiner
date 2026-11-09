@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -98,9 +99,7 @@ func (e *Engine) PublicKey() ed25519.PublicKey {
 
 // getOrCreateSession retrieves or instantiates the per-session WAL.
 func (e *Engine) getOrCreateSession(sessionID string) (*sessionWAL, error) {
-	if sessionID == "" {
-		sessionID = "default"
-	}
+	sessionID = SanitizeSessionID(sessionID)
 
 	e.mu.RLock()
 	if e.closed {
@@ -178,9 +177,7 @@ func (e *Engine) RecordRejection(ctx context.Context, intent IntentRecord) (*Cry
 
 // VerifySession verifies the entire hash-chained log for the specified session.
 func (e *Engine) VerifySession(sessionID string) ([]*SignedIntentReceipt, error) {
-	if sessionID == "" {
-		sessionID = "default"
-	}
+	sessionID = SanitizeSessionID(sessionID)
 
 	if e.inMemory {
 		e.mu.RLock()
@@ -200,7 +197,7 @@ func (e *Engine) VerifySession(sessionID string) ([]*SignedIntentReceipt, error)
 				return nil, fmt.Errorf("%w: expected prev_hash %s, got %s", ErrBrokenHashChain, expectedPrevHash, r.PrevReceiptHash)
 			}
 			if err := r.Verify(e.pubKey); err != nil {
-				return nil, fmt.Errorf("%w: %v", ErrInvalidSignature, err)
+				return nil, fmt.Errorf("%w: %w", ErrInvalidSignature, err)
 			}
 			expectedPrevHash = r.Hash()
 			expectedSeq++
@@ -209,7 +206,7 @@ func (e *Engine) VerifySession(sessionID string) ([]*SignedIntentReceipt, error)
 	}
 
 	filePath := filepath.Join(e.baseDir, safeSessionFilename(sessionID))
-	file, err := os.Open(filePath)
+	file, err := openSafeWALFile(filePath, os.O_RDONLY)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -218,14 +215,28 @@ func (e *Engine) VerifySession(sessionID string) ([]*SignedIntentReceipt, error)
 	}
 	defer file.Close()
 
-	return VerifyWAL(file, e.pubKey)
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_SH); err != nil {
+		return nil, fmt.Errorf("failed locking session WAL %s: %w", filePath, err)
+	}
+	defer func() {
+		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+	}()
+
+	receipts, err := VerifyWAL(file, e.pubKey)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range receipts {
+		if r.SessionID != sessionID {
+			return nil, fmt.Errorf("%w: WAL file %s contains mismatched session '%s'", ErrTamperedReceipt, filePath, r.SessionID)
+		}
+	}
+	return receipts, nil
 }
 
 // GetReceipts returns all in-memory receipts recorded for the given session.
 func (e *Engine) GetReceipts(sessionID string) ([]*SignedIntentReceipt, error) {
-	if sessionID == "" {
-		sessionID = "default"
-	}
+	sessionID = SanitizeSessionID(sessionID)
 
 	e.mu.RLock()
 	s, exists := e.sessions[sessionID]

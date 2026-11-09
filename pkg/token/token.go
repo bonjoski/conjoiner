@@ -53,6 +53,7 @@ type TaskToken struct {
 	JTI           string   `json:"jti"`
 	Issuer        string   `json:"iss"`
 	Subject       string   `json:"sub"`
+	SessionID     string   `json:"sid,omitempty"`
 	Audience      string   `json:"aud"`
 	IssuedAt      int64    `json:"iat"`
 	ExpiresAt     int64    `json:"exp"`

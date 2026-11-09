@@ -33,9 +33,9 @@ type PolicyEngine interface {
 
 // ToolRule defines deterministic constraints for a specific tool.
 type ToolRule struct {
-	AllowedActions   map[string]bool
-	AllowedFlags     map[string]bool
-	MaxArguments     int
+	AllowedActions     map[string]bool
+	AllowedFlags       map[string]bool
+	MaxArguments       int
 	AllowArbitraryArgs bool
 }
 
@@ -96,7 +96,19 @@ func (e *DeterministicPolicyEngine) Evaluate(ctx context.Context, tok *token.Tas
 	default:
 	}
 
-	// 1. Argument Injection Sanitization
+	if strings.TrimSpace(execCtx.ToolName) == "" || strings.TrimSpace(execCtx.Action) == "" {
+		return fmt.Errorf("%w: tool name and action are required", ErrPolicyViolation)
+	}
+	if strings.HasPrefix(strings.TrimSpace(execCtx.Action), "-") {
+		return fmt.Errorf("%w: action '%s' must not begin with a flag prefix", ErrPolicyViolation, execCtx.Action)
+	}
+
+	// 1. Argument & Action Injection Sanitization
+	for _, meta := range forbiddenMetachars {
+		if strings.Contains(execCtx.ToolName, meta) || strings.Contains(execCtx.Action, meta) || strings.Contains(execCtx.Resource, meta) {
+			return fmt.Errorf("%w: tool metadata contains forbidden metacharacter", ErrCommandInjectionDetected)
+		}
+	}
 	for _, arg := range execCtx.Arguments {
 		for _, meta := range forbiddenMetachars {
 			if strings.Contains(arg, meta) {
@@ -118,13 +130,19 @@ func (e *DeterministicPolicyEngine) Evaluate(ctx context.Context, tok *token.Tas
 		return fmt.Errorf("failed to parse token scopes: %w", err)
 	}
 
-	// Check candidate scopes that could authorize this action
+	toolExecRaw := fmt.Sprintf("tool:exec:%s:%s", execCtx.ToolName, execCtx.Action)
 	candidateScopes := []attenuation.Scope{
-		{Raw: "*", Domain: "*", Action: "*", Resource: "*"},
-		{Domain: "tool", Action: "exec", Resource: fmt.Sprintf("%s:%s", execCtx.ToolName, execCtx.Action)},
-		{Domain: "tool", Action: "exec", Resource: fmt.Sprintf("%s:*", execCtx.ToolName)},
-		{Domain: "tool", Action: execCtx.Action, Resource: execCtx.Resource},
-		{Domain: execCtx.ToolName, Action: execCtx.Action, Resource: execCtx.Resource},
+		{Raw: toolExecRaw, Domain: "tool", Action: "exec", Resource: fmt.Sprintf("%s:%s", execCtx.ToolName, execCtx.Action)},
+		{Raw: fmt.Sprintf("tool:%s:%s", execCtx.Action, execCtx.Resource), Domain: "tool", Action: execCtx.Action, Resource: execCtx.Resource},
+		{Raw: fmt.Sprintf("%s:%s:%s", execCtx.ToolName, execCtx.Action, execCtx.Resource), Domain: execCtx.ToolName, Action: execCtx.Action, Resource: execCtx.Resource},
+	}
+	if execCtx.Resource == "" {
+		candidateScopes = append(candidateScopes, attenuation.Scope{
+			Raw:      fmt.Sprintf("tool:%s:%s", execCtx.ToolName, execCtx.Action),
+			Domain:   "tool",
+			Action:   execCtx.ToolName,
+			Resource: execCtx.Action,
+		})
 	}
 
 	authorized := false
@@ -140,19 +158,39 @@ func (e *DeterministicPolicyEngine) Evaluate(ctx context.Context, tok *token.Tas
 			ErrScopeInsufficient, tok.Scope, execCtx.ToolName, execCtx.Action, execCtx.Resource)
 	}
 
-	// 4. Deterministic Tool Rule Validation
+	// 4. Deterministic Tool Rule Validation (CNJ-04: fail closed on unknown tools, disallowed flags, or arbitrary args)
 	rule, exists := e.toolRules[execCtx.ToolName]
-	if exists {
-		// Verify action is allowed
-		if len(rule.AllowedActions) > 0 && !rule.AllowedActions[execCtx.Action] {
-			return fmt.Errorf("%w: action '%s' is not in allowlist for tool '%s'",
-				ErrPolicyViolation, execCtx.Action, execCtx.ToolName)
+	if !exists {
+		return fmt.Errorf("%w: tool '%s' has no registered deterministic policy rule", ErrPolicyViolation, execCtx.ToolName)
+	}
+
+	if len(rule.AllowedActions) > 0 && !rule.AllowedActions[execCtx.Action] {
+		return fmt.Errorf("%w: action '%s' is not in allowlist for tool '%s'",
+			ErrPolicyViolation, execCtx.Action, execCtx.ToolName)
+	}
+
+	if rule.MaxArguments > 0 && len(execCtx.Arguments) > rule.MaxArguments {
+		return fmt.Errorf("%w: argument count %d exceeds maximum allowed %d for tool '%s'",
+			ErrPolicyViolation, len(execCtx.Arguments), rule.MaxArguments, execCtx.ToolName)
+	}
+
+	for _, arg := range execCtx.Arguments {
+		if strings.HasPrefix(arg, "-") {
+			if rule.AllowedFlags == nil || !rule.AllowedFlags[arg] {
+				return fmt.Errorf("%w: flag '%s' is not in allowlist for tool '%s'",
+					ErrPolicyViolation, arg, execCtx.ToolName)
+			}
+			continue
 		}
 
-		// Verify max arguments
-		if rule.MaxArguments > 0 && len(execCtx.Arguments) > rule.MaxArguments {
-			return fmt.Errorf("%w: argument count %d exceeds maximum allowed %d for tool '%s'",
-				ErrPolicyViolation, len(execCtx.Arguments), rule.MaxArguments, execCtx.ToolName)
+		if strings.Contains(arg, "..") {
+			return fmt.Errorf("%w: argument '%s' contains directory traversal sequence",
+				ErrPathTraversalDetected, arg)
+		}
+
+		if !rule.AllowArbitraryArgs {
+			return fmt.Errorf("%w: arbitrary positional argument '%s' is not permitted for tool '%s'",
+				ErrPolicyViolation, arg, execCtx.ToolName)
 		}
 	}
 

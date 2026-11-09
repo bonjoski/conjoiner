@@ -17,6 +17,8 @@ const (
 	GrantTypeTokenExchange = "urn:ietf:params:oauth:grant-type:token-exchange"
 	// TokenTypeAccessToken is the standard RFC 8693 token type identifier.
 	TokenTypeAccessToken = "urn:ietf:params:oauth:token-type:access_token"
+	// DefaultExchangeURI is the canonical DPoP HTU endpoint for token exchange when not overridden.
+	DefaultExchangeURI = "https://broker.local/token"
 )
 
 var (
@@ -32,16 +34,17 @@ var (
 
 // TokenExchangeRequest encapsulates an RFC 8693 Token Exchange payload.
 type TokenExchangeRequest struct {
-	GrantType          string   `json:"grant_type"`
-	SubjectToken       string   `json:"subject_token"`
-	SubjectTokenType   string   `json:"subject_token_type"`
-	RequestedTokenType string   `json:"requested_token_type,omitempty"`
-	Subject            string   `json:"subject,omitempty"` // Child agent identity
-	Audience           string   `json:"audience,omitempty"`
-	Scope              []string `json:"scope"`
+	GrantType          string        `json:"grant_type"`
+	SubjectToken       string        `json:"subject_token"`
+	SubjectTokenType   string        `json:"subject_token_type"`
+	RequestedTokenType string        `json:"requested_token_type,omitempty"`
+	Subject            string        `json:"subject,omitempty"` // Child agent identity
+	Audience           string        `json:"audience,omitempty"`
+	Scope              []string      `json:"scope"`
 	TTL                time.Duration `json:"ttl,omitempty"`
-	DPoPProof          string   `json:"dpop_proof"`
-	ExchangeURI        string   `json:"exchange_uri,omitempty"` // For DPoP HTU validation
+	DPoPProof          string        `json:"dpop_proof"`
+	ParentDPoPProof    string        `json:"parent_dpop_proof,omitempty"` // Proves possession of parentToken.CNF.JKT when delegating to a distinct child key
+	ExchangeURI        string        `json:"exchange_uri,omitempty"`      // For DPoP HTU validation
 }
 
 // TokenExchangeResponse represents an RFC 8693 Token Exchange response.
@@ -59,6 +62,7 @@ type TokenBroker struct {
 	brokerPubKey  ed25519.PublicKey
 	replayCache   ReplayCache
 	issuer        string
+	exchangeURI   string
 	defaultTTL    time.Duration
 }
 
@@ -68,6 +72,7 @@ type BrokerConfig struct {
 	PublicKey   ed25519.PublicKey
 	ReplayCache ReplayCache
 	Issuer      string
+	ExchangeURI string
 	DefaultTTL  time.Duration
 }
 
@@ -99,6 +104,7 @@ func NewTokenBroker(cfg BrokerConfig) (*TokenBroker, error) {
 		brokerPubKey:  cfg.PublicKey,
 		replayCache:   cfg.ReplayCache,
 		issuer:        cfg.Issuer,
+		exchangeURI:   strings.TrimSpace(cfg.ExchangeURI),
 		defaultTTL:    cfg.DefaultTTL,
 	}, nil
 }
@@ -115,10 +121,11 @@ func (b *TokenBroker) ReplayCache() ReplayCache {
 
 // RootTokenRequest contains parameters to issue an initial root parent token.
 type RootTokenRequest struct {
-	Subject       string
-	Audience      string
-	Scopes        []string
-	TTL           time.Duration
+	Subject        string
+	SessionID      string
+	Audience       string
+	Scopes         []string
+	TTL            time.Duration
 	DPoPThumbprint string
 }
 
@@ -162,6 +169,7 @@ func (b *TokenBroker) IssueRootToken(ctx context.Context, req RootTokenRequest) 
 		JTI:       jti,
 		Issuer:    b.issuer,
 		Subject:   req.Subject,
+		SessionID: req.SessionID,
 		Audience:  aud,
 		IssuedAt:  now.Unix(),
 		ExpiresAt: now.Add(ttl).Unix(),
@@ -179,10 +187,12 @@ func (b *TokenBroker) IssueRootToken(ctx context.Context, req RootTokenRequest) 
 }
 
 // ExchangeToken processes an RFC 8693 Token Exchange request, enforcing:
-// 1. DPoP proof validation from the requesting child agent
+// 1. DPoP proof validation from the requesting child agent (with pinned/non-empty HTU)
 // 2. Parent token signature & expiration check (30s TTL)
-// 3. Strict scope attenuation: ChildScope = ParentScope ∩ RequestedScope (superset denied)
-// 4. Token binding to child's ephemeral DPoP thumbprint
+// 3. Proof-of-Possession of parentToken.CNF.JKT (preventing stolen SubjectToken bearer replay)
+// 4. Strict scope attenuation: ChildScope = ParentScope ∩ RequestedScope (superset denied)
+// 5. Monotonic expiration clamping: childToken.ExpiresAt <= parentToken.ExpiresAt
+// 6. Token binding to child's ephemeral DPoP thumbprint
 func (b *TokenBroker) ExchangeToken(ctx context.Context, req TokenExchangeRequest) (*TokenExchangeResponse, *TaskToken, error) {
 	select {
 	case <-ctx.Done():
@@ -205,13 +215,24 @@ func (b *TokenBroker) ExchangeToken(ctx context.Context, req TokenExchangeReques
 
 	now := time.Now().UTC()
 
+	// Resolve canonical HTU for DPoP verification
+	expectedURI := b.exchangeURI
+	if expectedURI != "" {
+		if req.ExchangeURI != "" && req.ExchangeURI != expectedURI {
+			return nil, nil, fmt.Errorf("%w: got exchange_uri '%s', expected '%s'", ErrURIMismatch, req.ExchangeURI, expectedURI)
+		}
+	} else if strings.TrimSpace(req.ExchangeURI) != "" {
+		expectedURI = strings.TrimSpace(req.ExchangeURI)
+	} else {
+		expectedURI = DefaultExchangeURI
+	}
+
 	// 2. Validate DPoP proof presented by the requesting sub-agent
-	expectedURI := req.ExchangeURI
 	dpopPayload, dpopJWK, err := ValidateProof(
 		req.DPoPProof,
 		"POST",
 		expectedURI,
-		"", // No access token required during initial token exchange call
+		"", // Child proof binds the new child key; if ATH is supplied, checked below on self-attenuation
 		30*time.Second,
 		b.replayCache,
 		now,
@@ -228,11 +249,40 @@ func (b *TokenBroker) ExchangeToken(ctx context.Context, req TokenExchangeReques
 		return nil, nil, fmt.Errorf("subject token verification failed: %w", err)
 	}
 
+	// 4. Enforce Proof-of-Possession of parent token's bound DPoP key (CNJ-02)
+	if parentToken.CNF.JKT != "" {
+		if req.ParentDPoPProof != "" {
+			_, parentJWK, err := ValidateProof(
+				req.ParentDPoPProof,
+				"POST",
+				expectedURI,
+				req.SubjectToken, // Require RFC 9449 ath binding to SubjectToken
+				30*time.Second,
+				b.replayCache,
+				now,
+			)
+			if err != nil {
+				return nil, nil, fmt.Errorf("parent dpop proof verification failed: %w", err)
+			}
+			if !parentToken.VerifyDPoPBinding(parentJWK.Thumbprint()) {
+				return nil, nil, fmt.Errorf("%w: parent dpop proof key does not match subject_token cnf.jkt", ErrDPoPBindingMismatch)
+			}
+		} else {
+			// Self-attenuation: only permitted if child DPoP key IS the parent DPoP key
+			if !parentToken.VerifyDPoPBinding(childDPoPThumbprint) {
+				return nil, nil, fmt.Errorf("%w: missing parent dpop proof for subject_token bound to cnf.jkt", ErrDPoPBindingMismatch)
+			}
+			if dpopPayload.ATH != "" && dpopPayload.ATH != ComputeATH(req.SubjectToken) {
+				return nil, nil, ErrATHMismatch
+			}
+		}
+	}
+
 	if parentToken.Depth >= attenuation.MaxDelegationDepth {
 		return nil, nil, fmt.Errorf("%w: current depth %d", attenuation.ErrMaxDepthExceeded, parentToken.Depth)
 	}
 
-	// 4. Perform scope attenuation: ChildScope ⊆ ParentScope
+	// 5. Perform scope attenuation: ChildScope ⊆ ParentScope
 	parentScopeSet, err := parentToken.ScopeSet()
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed parsing parent scopes: %w", err)
@@ -248,13 +298,21 @@ func (b *TokenBroker) ExchangeToken(ctx context.Context, req TokenExchangeReques
 		return nil, nil, fmt.Errorf("attenuation denied: %w", err)
 	}
 
-	// 5. Enforce strict 30s TTL (or requested TTL up to MaxAllowedTTL)
+	// 6. Enforce strict 30s TTL (up to MaxAllowedTTL) AND clamp strictly <= parentToken.ExpiresAt
 	ttl := req.TTL
 	if ttl == 0 {
 		ttl = b.defaultTTL
 	}
 	if ttl > MaxAllowedTTL {
 		return nil, nil, fmt.Errorf("%w: %v > %v", ErrTTLTooLarge, ttl, MaxAllowedTTL)
+	}
+
+	childExpiresAt := now.Add(ttl).Unix()
+	if childExpiresAt > parentToken.ExpiresAt {
+		childExpiresAt = parentToken.ExpiresAt
+	}
+	if childExpiresAt <= now.Unix() {
+		return nil, nil, ErrExpiredToken
 	}
 
 	childJTI, err := GenerateRandomJTI()
@@ -276,9 +334,10 @@ func (b *TokenBroker) ExchangeToken(ctx context.Context, req TokenExchangeReques
 		JTI:           childJTI,
 		Issuer:        b.issuer,
 		Subject:       childSubject,
+		SessionID:     parentToken.SessionID,
 		Audience:      childAudience,
 		IssuedAt:      now.Unix(),
-		ExpiresAt:     now.Add(ttl).Unix(),
+		ExpiresAt:     childExpiresAt,
 		Scope:         attenuatedScopeSet.Strings(),
 		CNF:           CNF{JKT: childDPoPThumbprint},
 		ParentTokenID: parentToken.JTI,
@@ -294,11 +353,9 @@ func (b *TokenBroker) ExchangeToken(ctx context.Context, req TokenExchangeReques
 		AccessToken:     signedChildToken,
 		IssuedTokenType: TokenTypeAccessToken,
 		TokenType:       "DPoP",
-		ExpiresIn:       int64(ttl.Seconds()),
+		ExpiresIn:       childExpiresAt - now.Unix(),
 		Scope:           strings.Join(attenuatedScopeSet.Strings(), " "),
 	}
-
-	_ = dpopPayload // consumed
 
 	return response, childToken, nil
 }

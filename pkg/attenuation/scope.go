@@ -28,6 +28,10 @@ type Scope struct {
 
 // ParseScope parses a raw scope string into a structured Scope.
 func ParseScope(raw string) (Scope, error) {
+	if strings.ContainsRune(raw, '\x00') {
+		return Scope{}, fmt.Errorf("%w: scope contains NUL byte", ErrInvalidScopeFormat)
+	}
+
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return Scope{}, ErrEmptyScope
@@ -49,6 +53,10 @@ func ParseScope(raw string) (Scope, error) {
 
 	domain := parts[0]
 	action := parts[1]
+	if domain == "" || action == "" || strings.ContainsAny(domain, " \t\r\n") || strings.ContainsAny(action, " \t\r\n") {
+		return Scope{}, fmt.Errorf("%w: '%s', domain and action must be non-empty", ErrInvalidScopeFormat, trimmed)
+	}
+
 	resource := ""
 	if len(parts) >= 3 {
 		resource = strings.Join(parts[2:], ":")
@@ -67,59 +75,171 @@ func (s Scope) String() string {
 	return s.Raw
 }
 
+func containsNULScope(s Scope) bool {
+	return strings.ContainsRune(s.Raw, '\x00') ||
+		strings.ContainsRune(s.Domain, '\x00') ||
+		strings.ContainsRune(s.Action, '\x00') ||
+		strings.ContainsRune(s.Resource, '\x00')
+}
+
+func hasDotDotSegment(resource string) bool {
+	if resource == "" {
+		return false
+	}
+	normalized := strings.ReplaceAll(resource, "\\", "/")
+	for _, colonPart := range strings.Split(normalized, ":") {
+		for _, seg := range strings.Split(colonPart, "/") {
+			if seg == ".." {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isFilesystemDomain(domain string) bool {
+	return domain == "fs" || domain == "file"
+}
+
+func isValidResourceWildcard(resource string, fsMode bool) bool {
+	if resource == "*" {
+		return true
+	}
+	if strings.HasSuffix(resource, "/*") {
+		base := strings.TrimSuffix(resource, "/*")
+		return !strings.Contains(base, "*")
+	}
+	if !fsMode && strings.HasSuffix(resource, ":*") {
+		base := strings.TrimSuffix(resource, ":*")
+		return base != "" && !strings.Contains(base, "*")
+	}
+	return false
+}
+
 // Covers returns true if this parent scope (s) authoritatively permits the child scope (other).
 // A child scope is covered if and only if:
-// 1. Parent is wildcard "*", OR
-// 2. Exact match on raw string, OR
+// 1. Neither scope contains NUL bytes or `..` traversal segments, AND
+// 2. Parent is wildcard "*", OR
 // 3. Domain matches (or parent domain is "*"), AND Action matches (or parent action is "*"), AND
-//    Resource matches with prefix/path/wildcard semantics.
+//    Resource satisfies monotonic path containment or segment-boundary wildcard semantics (never expanding a non-wildcard parent into a wildcard child).
 func (s Scope) Covers(other Scope) bool {
-	if s.Raw == "*" {
-		return true
+	if containsNULScope(s) || containsNULScope(other) {
+		return false
 	}
-	if s.Raw == other.Raw {
-		return true
-	}
-
-	// Check domain
-	if s.Domain != "*" && s.Domain != other.Domain {
+	if hasDotDotSegment(s.Resource) || hasDotDotSegment(other.Resource) {
 		return false
 	}
 
-	// Check action
+	if s.Raw == "*" || (s.Domain == "*" && s.Action == "*" && s.Resource == "*") {
+		if strings.Contains(other.Resource, "*") {
+			return isValidResourceWildcard(other.Resource, isFilesystemDomain(other.Domain))
+		}
+		return true
+	}
+
+	// Non-root parent can never cover wildcard domain or wildcard action unless parent also has "*"
+	if s.Domain != "*" && s.Domain != other.Domain {
+		return false
+	}
 	if s.Action != "*" && s.Action != other.Action {
 		return false
 	}
 
-	// Check resource
-	if s.Resource == "*" || s.Resource == "" {
-		return true
+	fsMode := isFilesystemDomain(s.Domain) || isFilesystemDomain(other.Domain)
+
+	// CRITICAL INVARIANT (CNJ-01): A non-wildcard parent resource MUST NEVER cover a child resource containing "*".
+	parentIsWildcard := isValidResourceWildcard(s.Resource, fsMode)
+	if strings.Contains(other.Resource, "*") {
+		if !parentIsWildcard {
+			return false
+		}
+		if !isValidResourceWildcard(other.Resource, fsMode) {
+			return false
+		}
 	}
 
-	// If parent resource ends with wildcard "*", check prefix
-	if strings.HasSuffix(s.Resource, "*") {
-		prefix := strings.TrimSuffix(s.Resource, "*")
-		return strings.HasPrefix(other.Resource, prefix)
+	// Reject malformed non-boundary wildcards on parent (e.g. "db:select:users*" or "fs:read:/tmp*")
+	if strings.Contains(s.Resource, "*") && !parentIsWildcard {
+		return false
 	}
 
-	// For filesystem domains ("fs" or "file"), check filepath containment
-	if s.Domain == "fs" || s.Domain == "file" {
-		parentPath := filepath.Clean(s.Resource)
-		childPath := filepath.Clean(other.Resource)
+	// Full-resource wildcard "*" on parent
+	if s.Resource == "*" {
+		return other.Resource != ""
+	}
 
-		if parentPath == childPath {
-			return true
+	// Empty resource only matches empty resource (never acts as implicit "*")
+	if s.Resource == "" || other.Resource == "" {
+		return s.Resource == "" && other.Resource == ""
+	}
+
+	// Filesystem containment ("fs" or "file")
+	if fsMode {
+		if other.Resource == "*" {
+			return false
+		}
+		parentHasSlashStar := strings.HasSuffix(s.Resource, "/*")
+		childHasSlashStar := strings.HasSuffix(other.Resource, "/*")
+		if childHasSlashStar && !parentHasSlashStar {
+			return false
 		}
 
-		rel, err := filepath.Rel(parentPath, childPath)
+		rawParent := s.Resource
+		if parentHasSlashStar {
+			rawParent = strings.TrimSuffix(s.Resource, "/*")
+			if rawParent == "" {
+				rawParent = "/"
+			}
+		}
+		rawChild := other.Resource
+		if childHasSlashStar {
+			rawChild = strings.TrimSuffix(other.Resource, "/*")
+			if rawChild == "" {
+				rawChild = "/"
+			}
+		}
+
+		absParent, err := filepath.Abs(filepath.Clean(rawParent))
 		if err != nil {
 			return false
 		}
-		// If childPath is inside parentPath, rel will not start with ".." and not equal ".."
-		if !strings.HasPrefix(rel, "..") && rel != "." {
+		absChild, err := filepath.Abs(filepath.Clean(rawChild))
+		if err != nil {
+			return false
+		}
+
+		rel, err := filepath.Rel(absParent, absChild)
+		if err != nil {
+			return false
+		}
+		if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return false
+		}
+		if rel == "." {
+			return parentHasSlashStar == childHasSlashStar
+		}
+		return true
+	}
+
+	// Non-filesystem segment-boundary wildcard matching (":*" or "/*")
+	if strings.HasSuffix(s.Resource, ":*") || strings.HasSuffix(s.Resource, "/*") {
+		if other.Resource == "*" {
+			return false
+		}
+		sep := s.Resource[len(s.Resource)-2]
+		base := s.Resource[:len(s.Resource)-2]
+		if base == "" {
+			return false
+		}
+		if other.Resource == s.Resource {
 			return true
 		}
-		return false
+		target := other.Resource
+		if strings.HasSuffix(target, ":*") || strings.HasSuffix(target, "/*") {
+			target = target[:len(target)-2]
+		}
+		prefix := base + string(sep)
+		return strings.HasPrefix(target, prefix) && len(target) > len(prefix)
 	}
 
 	return s.Resource == other.Resource

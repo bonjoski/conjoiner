@@ -5,9 +5,11 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"time"
 )
 
@@ -41,6 +43,22 @@ const (
 	VerdictDenyDrift PolicyVerdict = "DENY_DRIFT"
 )
 
+func writeUint64BE(h hash.Hash, v uint64) {
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], v)
+	_, _ = h.Write(buf[:])
+}
+
+func writeLenPrefixedBytes(h hash.Hash, b []byte) {
+	writeUint64BE(h, uint64(len(b)))
+	_, _ = h.Write(b)
+}
+
+func writeLenPrefixedString(h hash.Hash, s string) {
+	writeUint64BE(h, uint64(len(s)))
+	_, _ = h.Write([]byte(s))
+}
+
 // SignedIntentReceipt (SIR) represents an indisputable, tamper-evident cryptographic receipt
 // recorded into an append-only WAL fulfilling NIST SP 800-207A Tenet #7.
 type SignedIntentReceipt struct {
@@ -59,24 +77,23 @@ type SignedIntentReceipt struct {
 	ReceiptSignature string        `json:"receipt_sig"`
 }
 
-// SigningInput computes the deterministic byte representation of the receipt for signing.
+// SigningInput computes the unambiguous uint64 big-endian length-prefixed canonical digest of the receipt (CNJ-07).
 func (r *SignedIntentReceipt) SigningInput() []byte {
-	canonical := fmt.Sprintf("%s|%d|%s|%d|%s|%s|%s|%s|%s|%s|%s|%s",
-		r.ReceiptID,
-		r.SequenceNumber,
-		r.PrevReceiptHash,
-		r.Timestamp.UnixNano(),
-		r.SessionID,
-		r.AgentIdentity,
-		r.ToolName,
-		r.ArgumentDigest,
-		r.MandateSignature,
-		r.DPoPSignature,
-		r.Verdict,
-		r.RejectionReason,
-	)
-	digest := sha256.Sum256([]byte(canonical))
-	return digest[:]
+	h := sha256.New()
+	writeLenPrefixedString(h, "conjoiner:sir:v2")
+	writeLenPrefixedString(h, r.ReceiptID)
+	writeUint64BE(h, r.SequenceNumber)
+	writeLenPrefixedString(h, r.PrevReceiptHash)
+	writeUint64BE(h, uint64(r.Timestamp.UTC().UnixNano()))
+	writeLenPrefixedString(h, r.SessionID)
+	writeLenPrefixedString(h, r.AgentIdentity)
+	writeLenPrefixedString(h, r.ToolName)
+	writeLenPrefixedString(h, r.ArgumentDigest)
+	writeLenPrefixedString(h, r.MandateSignature)
+	writeLenPrefixedString(h, r.DPoPSignature)
+	writeLenPrefixedString(h, string(r.Verdict))
+	writeLenPrefixedString(h, r.RejectionReason)
+	return h.Sum(nil)
 }
 
 // Sign signs the receipt with Conjoiner's Ed25519 private key.
@@ -99,7 +116,7 @@ func (r *SignedIntentReceipt) Verify(pubKey ed25519.PublicKey) error {
 	}
 	sigBytes, err := base64.RawURLEncoding.DecodeString(r.ReceiptSignature)
 	if err != nil {
-		return fmt.Errorf("%w: invalid signature encoding: %v", ErrInvalidSignature, err)
+		return fmt.Errorf("%w: invalid signature encoding: %w", ErrInvalidSignature, err)
 	}
 	if !ed25519.Verify(pubKey, r.SigningInput(), sigBytes) {
 		return ErrInvalidSignature
@@ -110,10 +127,11 @@ func (r *SignedIntentReceipt) Verify(pubKey ed25519.PublicKey) error {
 // Hash computes the cryptographic SHA-256 hash of this receipt including its signature.
 // This hash serves as the PrevReceiptHash for the next receipt in the session chain.
 func (r *SignedIntentReceipt) Hash() string {
-	signingDigest := r.SigningInput()
-	canonical := fmt.Sprintf("%x|%s", signingDigest, r.ReceiptSignature)
-	digest := sha256.Sum256([]byte(canonical))
-	return hex.EncodeToString(digest[:])
+	h := sha256.New()
+	writeLenPrefixedString(h, "conjoiner:sir-hash:v2")
+	writeLenPrefixedBytes(h, r.SigningInput())
+	writeLenPrefixedString(h, r.ReceiptSignature)
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // CryptographicRejectionProof (CRP) is emitted when an agent attempts an unauthorized state change,
@@ -141,20 +159,19 @@ func (crp *CryptographicRejectionProof) Error() string {
 		crp.Verdict, crp.Reason, receiptID, seq)
 }
 
-// SigningInput computes the deterministic byte representation of the rejection proof.
+// SigningInput computes the unambiguous length-prefixed canonical digest of the rejection proof.
 func (crp *CryptographicRejectionProof) SigningInput() []byte {
 	receiptHash := ""
 	if crp.Receipt != nil {
 		receiptHash = crp.Receipt.Hash()
 	}
-	canonical := fmt.Sprintf("%s|%s|%s|%d",
-		receiptHash,
-		crp.Verdict,
-		crp.Reason,
-		crp.BlockedAt.UnixNano(),
-	)
-	digest := sha256.Sum256([]byte(canonical))
-	return digest[:]
+	h := sha256.New()
+	writeLenPrefixedString(h, "conjoiner:crp:v2")
+	writeLenPrefixedString(h, receiptHash)
+	writeLenPrefixedString(h, string(crp.Verdict))
+	writeLenPrefixedString(h, crp.Reason)
+	writeUint64BE(h, uint64(crp.BlockedAt.UTC().UnixNano()))
+	return h.Sum(nil)
 }
 
 // Sign signs the rejection proof with Conjoiner's Ed25519 private key.
@@ -183,7 +200,7 @@ func (crp *CryptographicRejectionProof) Verify(pubKey ed25519.PublicKey) error {
 	}
 	sigBytes, err := base64.RawURLEncoding.DecodeString(crp.ProofSignature)
 	if err != nil {
-		return fmt.Errorf("%w: invalid proof signature encoding: %v", ErrInvalidSignature, err)
+		return fmt.Errorf("%w: invalid proof signature encoding: %w", ErrInvalidSignature, err)
 	}
 	if !ed25519.Verify(pubKey, crp.SigningInput(), sigBytes) {
 		return ErrInvalidSignature
@@ -232,18 +249,16 @@ func ExtractRejectionProof(err error) *CryptographicRejectionProof {
 	return nil
 }
 
-// ComputeArgumentDigest computes the deterministic SHA-256 digest of invocation arguments.
+// ComputeArgumentDigest computes the unambiguous length-prefixed SHA-256 digest of invocation arguments.
 func ComputeArgumentDigest(toolName, action, resource string, args []string) string {
 	h := sha256.New()
-	h.Write([]byte(toolName))
-	h.Write([]byte{0})
-	h.Write([]byte(action))
-	h.Write([]byte{0})
-	h.Write([]byte(resource))
-	h.Write([]byte{0})
+	writeLenPrefixedString(h, "conjoiner:args:v2")
+	writeLenPrefixedString(h, toolName)
+	writeLenPrefixedString(h, action)
+	writeLenPrefixedString(h, resource)
+	writeUint64BE(h, uint64(len(args)))
 	for _, arg := range args {
-		h.Write([]byte(arg))
-		h.Write([]byte{0})
+		writeLenPrefixedString(h, arg)
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }

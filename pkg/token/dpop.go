@@ -242,6 +242,10 @@ func ValidateProof(
 		return nil, nil, fmt.Errorf("%w: malformed payload json: %w", ErrInvalidDPoPProof, err)
 	}
 
+	if strings.TrimSpace(payload.JTI) == "" {
+		return nil, nil, fmt.Errorf("%w: missing jti claim", ErrInvalidDPoPProof)
+	}
+
 	// Verify timestamp and skew
 	proofTime := time.Unix(payload.IAT, 0).UTC()
 	diff := now.Sub(proofTime)
@@ -258,8 +262,8 @@ func ValidateProof(
 		return nil, nil, fmt.Errorf("%w: got '%s', expected '%s'", ErrMethodMismatch, payload.HTM, expectedMethod)
 	}
 
-	// Verify HTU (URI)
-	if expectedURI != "" && payload.HTU != expectedURI {
+	// Verify HTU (URI) - always require non-empty HTU and match against expectedURI
+	if strings.TrimSpace(payload.HTU) == "" || expectedURI == "" || payload.HTU != expectedURI {
 		return nil, nil, fmt.Errorf("%w: got '%s', expected '%s'", ErrURIMismatch, payload.HTU, expectedURI)
 	}
 

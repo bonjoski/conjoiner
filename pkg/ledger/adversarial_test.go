@@ -3,6 +3,8 @@ package ledger
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestAdversarialTamperResistance_CorruptedSignature(t *testing.T) {
@@ -440,5 +443,144 @@ func TestAdversarial_PathTraversalSessionID(t *testing.T) {
 				t.Fatalf("found unexpected subdirectory in ledger dir: %s", e.Name())
 			}
 		}
+	}
+}
+
+// TestCNJ06_WALNoFollowSymlinkGuard0600AndCrossEngineFlock verifies:
+// 1. Pre-planted symlinked `.wal` file is rejected (`O_NOFOLLOW` / `Lstat`).
+// 2. WAL files are created with strict `0600` mode.
+// 3. Multiple independent `Engine` instances writing concurrently to the same WAL file synchronize via `syscall.Flock`.
+func TestCNJ06_WALNoFollowSymlinkGuard0600AndCrossEngineFlock(t *testing.T) {
+	tmpDir := t.TempDir()
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+
+	// 1. Symlink attack on session WAL file MUST fail closed
+	victimFile := filepath.Join(tmpDir, "victim.txt")
+	if err := os.WriteFile(victimFile, []byte("DO NOT CLOBBER"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	symlinkWAL := filepath.Join(tmpDir, safeSessionFilename("symlink-sess"))
+	if err := os.Symlink(victimFile, symlinkWAL); err != nil {
+		t.Fatal(err)
+	}
+
+	eng, err := NewEngine(Config{BaseDir: tmpDir, PrivateKey: priv})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	if _, err := eng.Record(context.Background(), IntentRecord{
+		SessionID: "symlink-sess",
+		ToolName:  "git",
+		Action:    "status",
+		Verdict:   VerdictAllow,
+	}); err == nil {
+		t.Fatal("CNJ-06 FAILED: Engine appended through symlinked WAL file!")
+	}
+
+	// 2. Multi-engine concurrent writes to the SAME session file on disk (exercising syscall.Flock + disk head refresh)
+	sharedDir := t.TempDir()
+	const enginesCount = 4
+	const writesEach = 15
+	var wg sync.WaitGroup
+	errCh := make(chan error, enginesCount*writesEach)
+
+	for eIdx := 0; eIdx < enginesCount; eIdx++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			inst, err := NewEngine(Config{BaseDir: sharedDir, PrivateKey: priv, SyncWrites: true})
+			if err != nil {
+				errCh <- err
+				return
+			}
+			defer inst.Close()
+
+			for i := 0; i < writesEach; i++ {
+				if _, err := inst.Record(context.Background(), IntentRecord{
+					SessionID:     "flock-shared",
+					AgentIdentity: fmt.Sprintf("proc-%d", id),
+					ToolName:      "git",
+					Action:        "status",
+					Verdict:       VerdictAllow,
+				}); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}(eIdx)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("cross-engine flock write failed: %v", err)
+	}
+
+	verifierEng, _ := NewEngine(Config{BaseDir: sharedDir, PrivateKey: priv})
+	defer verifierEng.Close()
+	verified, err := verifierEng.VerifySession("flock-shared")
+	if err != nil {
+		t.Fatalf("CNJ-06 FAILED: cross-engine flock WAL chain corrupted: %v", err)
+	}
+	if len(verified) != enginesCount*writesEach {
+		t.Fatalf("expected %d receipts, got %d", enginesCount*writesEach, len(verified))
+	}
+
+	walInfo, err := os.Stat(filepath.Join(sharedDir, safeSessionFilename("flock-shared")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if walInfo.Mode().Perm() != 0600 {
+		t.Fatalf("CNJ-06 FAILED: expected WAL permissions 0600, got %04o", walInfo.Mode().Perm())
+	}
+}
+
+// TestCNJ07_LengthPrefixedSigningInputPreventsDelimiterCollision verifies `|` field boundary
+// shifts can never collide in `SignedIntentReceipt.SigningInput()` or `ComputeArgumentDigest`.
+func TestCNJ07_LengthPrefixedSigningInputPreventsDelimiterCollision(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	ts := time.Unix(1700000000, 123456789).UTC()
+
+	r1 := &SignedIntentReceipt{
+		ReceiptID:        "id-1",
+		SequenceNumber:   1,
+		PrevReceiptHash:  GenesisPrevHash,
+		Timestamp:        ts,
+		SessionID:        "sess",
+		AgentIdentity:    "alice|git",
+		ToolName:         "status",
+		ArgumentDigest:   "dig",
+		MandateSignature: "msig",
+		DPoPSignature:    "dsig",
+		Verdict:          VerdictAllow,
+	}
+	r2 := &SignedIntentReceipt{
+		ReceiptID:        "id-1",
+		SequenceNumber:   1,
+		PrevReceiptHash:  GenesisPrevHash,
+		Timestamp:        ts,
+		SessionID:        "sess",
+		AgentIdentity:    "alice",
+		ToolName:         "git|status",
+		ArgumentDigest:   "dig",
+		MandateSignature: "msig",
+		DPoPSignature:    "dsig",
+		Verdict:          VerdictAllow,
+	}
+
+	if bytes.Equal(r1.SigningInput(), r2.SigningInput()) {
+		t.Fatal("CNJ-07 FAILED: '|' field-shift produced identical SigningInput() digest!")
+	}
+	if err := r1.Sign(priv); err != nil {
+		t.Fatal(err)
+	}
+	r2.ReceiptSignature = r1.ReceiptSignature
+	if err := r2.Verify(pub); err == nil {
+		t.Fatal("CNJ-07 FAILED: signature from 'alice|git'/'status' verified on 'alice'/'git|status'!")
+	}
+
+	if ComputeArgumentDigest("git\x00status", "", "", nil) == ComputeArgumentDigest("git", "status", "", nil) {
+		t.Fatal("CNJ-07 FAILED: NUL-byte field shift collided in ComputeArgumentDigest!")
 	}
 }

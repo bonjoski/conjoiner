@@ -196,6 +196,7 @@ func handleTokenCommand(args []string) {
 			"dpop_key": map[string]string{
 				"thumbprint": dpopKey.Thumbprint(),
 				"jwk_x":      dpopKey.JWK().X,
+				"priv":       base64.RawURLEncoding.EncodeToString(dpopKey.PrivateKey),
 			},
 		}
 
@@ -205,6 +206,7 @@ func handleTokenCommand(args []string) {
 	case "attenuate":
 		attenuateCmd := flag.NewFlagSet("token attenuate", flag.ExitOnError)
 		parentFlag := attenuateCmd.String("parent", "", "Parent token JWT or JSON object containing access_token")
+		parentDPoPFlag := attenuateCmd.String("parent-dpop", "", "Parent DPoP proof JWT (optional if --parent JSON includes dpop_key.priv)")
 		reqScopeFlag := attenuateCmd.String("requested-scope", "", "Requested attenuated scopes (must be subset)")
 		ttlFlag := attenuateCmd.Duration("ttl", 30*time.Second, "Child token TTL")
 
@@ -218,13 +220,32 @@ func handleTokenCommand(args []string) {
 			os.Exit(1)
 		}
 
+		exchangeURI := token.DefaultExchangeURI
+
 		// Extract parent token string (may be raw JWT or JSON object)
 		parentJWT := *parentFlag
+		parentProof := *parentDPoPFlag
 		if strings.HasPrefix(strings.TrimSpace(parentJWT), "{") {
 			var parsed map[string]any
 			if err := json.Unmarshal([]byte(parentJWT), &parsed); err == nil {
 				if tok, ok := parsed["access_token"].(string); ok {
 					parentJWT = tok
+				}
+				if parentProof == "" {
+					if dkMap, ok := parsed["dpop_key"].(map[string]any); ok {
+						if privB64, ok := dkMap["priv"].(string); ok && privB64 != "" {
+							if privBytes, decErr := base64.RawURLEncoding.DecodeString(privB64); decErr == nil && len(privBytes) == ed25519.PrivateKeySize {
+								parentKey := &token.DPoPKey{
+									PrivateKey: ed25519.PrivateKey(privBytes),
+									PublicKey:  ed25519.PrivateKey(privBytes).Public().(ed25519.PublicKey),
+								}
+								if p, pErr := parentKey.CreateProof("POST", exchangeURI, parentJWT); pErr == nil {
+									parentProof = p
+								}
+								parentKey.Zeroize()
+							}
+						}
+					}
 				}
 			}
 		}
@@ -236,8 +257,9 @@ func handleTokenCommand(args []string) {
 		}
 
 		broker, err := token.NewTokenBroker(token.BrokerConfig{
-			PrivateKey: keys.PrivateKey,
-			PublicKey:  keys.PublicKey,
+			PrivateKey:  keys.PrivateKey,
+			PublicKey:   keys.PublicKey,
+			ExchangeURI: exchangeURI,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -250,7 +272,6 @@ func handleTokenCommand(args []string) {
 			os.Exit(1)
 		}
 
-		exchangeURI := "https://broker.local/token"
 		childProof, err := childDPoP.CreateProof("POST", exchangeURI, "")
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error generating DPoP proof: %v\n", err)
@@ -265,6 +286,7 @@ func handleTokenCommand(args []string) {
 			Scope:            splitScopes(*reqScopeFlag),
 			TTL:              *ttlFlag,
 			DPoPProof:        childProof,
+			ParentDPoPProof:  parentProof,
 			ExchangeURI:      exchangeURI,
 		})
 		if err != nil {
@@ -450,6 +472,7 @@ func handleMandateCommand(args []string) {
 func handleMandateCompile(args []string) {
 	fs := flag.NewFlagSet("conjoiner mandate compile", flag.ExitOnError)
 	aiFlag := fs.Bool("ai", false, "Use Shield-protected AI inference to compile instructions into scopes")
+	ceilingFlag := fs.String("ceiling", "", "Comma-separated ceiling scopes bounding compiled output")
 	jsonFlag := fs.Bool("json", false, "Output compiled capability scopes as JSON")
 	_ = fs.Parse(args)
 
@@ -460,7 +483,20 @@ func handleMandateCompile(args []string) {
 	}
 	instruction := strings.Join(rest, " ")
 
-	res, err := mandate.Compile(context.Background(), instruction, *aiFlag)
+	var (
+		res *mandate.Result
+		err error
+	)
+	if strings.TrimSpace(*ceilingFlag) != "" {
+		ceilingSet, cErr := attenuation.NewScopeSet(splitScopes(*ceilingFlag)...)
+		if cErr != nil {
+			fmt.Fprintf(os.Stderr, "conjoiner mandate invalid --ceiling: %v\n", cErr)
+			os.Exit(1)
+		}
+		res, err = mandate.CompileWithCeiling(context.Background(), instruction, *aiFlag, ceilingSet)
+	} else {
+		res, err = mandate.Compile(context.Background(), instruction, *aiFlag)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "conjoiner mandate compile failed: %v\n", err)
 		os.Exit(1)
@@ -485,7 +521,8 @@ func handleMandateCompile(args []string) {
 // MCP Shim & Proxy CLI subcommands
 func handleMCPShimCommand(args []string) {
 	shimCmd := flag.NewFlagSet("mcp-shim", flag.ExitOnError)
-	scopeFlag := shimCmd.String("scope", "", "Comma-separated allowed scopes (default: ambient CONJOINER_SCOPES or allow-all)")
+	scopeFlag := shimCmd.String("scope", "", "Comma-separated allowed scopes (or set CONJOINER_SCOPES)")
+	tokenFlag := shimCmd.String("token", "", "Signed Conjoiner TaskToken JWT (or set CONJOINER_TOKEN)")
 	noRedactFlag := shimCmd.Bool("no-redact", false, "Disable Shield secret output redaction")
 
 	// Find "--" delimiter separating flags from target command
@@ -512,8 +549,8 @@ func handleMCPShimCommand(args []string) {
 	}
 
 	if len(targetArgs) == 0 {
-		fmt.Fprintln(os.Stderr, "Usage: conjoiner mcp-shim [--scope <scopes>] -- <target-command> [args...]")
-		fmt.Fprintln(os.Stderr, "   or: mcp-conjoiner-proxy [--scope <scopes>] -- <target-command> [args...]")
+		fmt.Fprintln(os.Stderr, "Usage: conjoiner mcp-shim [--scope <scopes> | --token <jwt>] -- <target-command> [args...]")
+		fmt.Fprintln(os.Stderr, "   or: mcp-conjoiner-proxy [--scope <scopes> | --token <jwt>] -- <target-command> [args...]")
 		os.Exit(1)
 	}
 
@@ -522,10 +559,19 @@ func handleMCPShimCommand(args []string) {
 		allowedScopes = strings.Split(*scopeFlag, ",")
 	}
 
+	var brokerPubKey ed25519.PublicKey
+	if *tokenFlag != "" || os.Getenv("CONJOINER_TOKEN") != "" {
+		if keys, kErr := getOrGenerateBrokerKeys(); kErr == nil {
+			brokerPubKey = keys.PublicKey
+		}
+	}
+
 	cfg := mcp.Config{
 		TargetCommand: targetArgs[0],
 		TargetArgs:    targetArgs[1:],
 		AllowedScopes: allowedScopes,
+		Token:         *tokenFlag,
+		BrokerPubKey:  brokerPubKey,
 		ScrubSecrets:  !*noRedactFlag,
 	}
 

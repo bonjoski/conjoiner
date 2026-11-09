@@ -1,38 +1,15 @@
 package mcp
 
 import (
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/bonjoski/shield/pkg/shield"
 )
-
-// Zero-width and invisible runes commonly weaponized for prompt injection smuggling.
-var invisibleRunes = map[rune]bool{
-	'\u200B': true, // Zero-width space
-	'\u200C': true, // Zero-width non-joiner
-	'\u200D': true, // Zero-width joiner
-	'\uFEFF': true, // Zero-width no-break space / BOM
-	'\u00AD': true, // Soft hyphen
-	'\u200E': true, // Left-to-Right mark
-	'\u200F': true, // Right-to-Left mark
-	'\u202A': true, // LRE
-	'\u202B': true, // RLE
-	'\u202C': true, // PDF
-	'\u202D': true, // LRO
-	'\u202E': true, // RLO (Right-to-Left override)
-	'\u2060': true, // Word joiner
-	'\u2061': true, // Function application
-	'\u2062': true, // Invisible times
-	'\u2063': true, // Invisible separator
-	'\u2064': true, // Invisible plus
-	'\u2066': true, // LRI
-	'\u2067': true, // RLI
-	'\u2068': true, // FSI
-	'\u2069': true, // PDI
-}
 
 // Regex signatures for prompt injection, jailbreaks, and system prompt override attempts.
 var (
@@ -52,7 +29,21 @@ func NewSanitizer() *Sanitizer {
 	}
 }
 
-// StripInvisibleUnicode removes invisible control runes and decodes Unicode tag character smuggling.
+func isInvisibleOrVariationRune(r rune) bool {
+	// Unicode Variation Selectors (BMP U+FE00..U+FE0F, Ideographic U+E0100..U+E01EF, Mongolian U+180B..U+180F)
+	if (r >= 0xFE00 && r <= 0xFE0F) || (r >= 0xE0100 && r <= 0xE01EF) || (r >= 0x180B && r <= 0x180F) {
+		return true
+	}
+	// Combining Grapheme Joiner and Hangul/Halfwidth invisible fillers
+	switch r {
+	case '\u034F', '\u115F', '\u1160', '\u3164', '\uFFA0':
+		return true
+	}
+	// All Unicode Format (Cf) runes (includes U+00AD soft hyphen, bidi overrides/isolates, zero-width spaces/joiners, BOM)
+	return unicode.Is(unicode.Cf, r)
+}
+
+// StripInvisibleUnicode removes invisible format/variation runes and decodes Plane 14 Unicode tag character smuggling.
 func StripInvisibleUnicode(input string) (string, int, string) {
 	if !utf8.ValidString(input) {
 		input = strings.ToValidUTF8(input, "")
@@ -72,7 +63,7 @@ func StripInvisibleUnicode(input string) (string, int, string) {
 			continue
 		}
 
-		if invisibleRunes[r] {
+		if isInvisibleOrVariationRune(r) {
 			strippedCount++
 			continue
 		}
@@ -105,6 +96,46 @@ func DetectPromptInjection(input string) (bool, string) {
 		}
 	}
 
+	return false, ""
+}
+
+// DetectJSONPromptInjection inspects both raw JSON bytes and recursively unescaped JSON string values.
+func DetectJSONPromptInjection(rawJSON []byte) (bool, string) {
+	if len(rawJSON) == 0 {
+		return false, ""
+	}
+	if injected, reason := DetectPromptInjection(string(rawJSON)); injected {
+		return true, reason
+	}
+	var decoded any
+	if err := json.Unmarshal(rawJSON, &decoded); err == nil {
+		if injected, reason := scanDecodedJSONStrings(decoded); injected {
+			return true, reason
+		}
+	}
+	return false, ""
+}
+
+func scanDecodedJSONStrings(v any) (bool, string) {
+	switch val := v.(type) {
+	case string:
+		return DetectPromptInjection(val)
+	case map[string]any:
+		for k, item := range val {
+			if injected, reason := DetectPromptInjection(k); injected {
+				return true, reason
+			}
+			if injected, reason := scanDecodedJSONStrings(item); injected {
+				return true, reason
+			}
+		}
+	case []any:
+		for _, item := range val {
+			if injected, reason := scanDecodedJSONStrings(item); injected {
+				return true, reason
+			}
+		}
+	}
 	return false, ""
 }
 
