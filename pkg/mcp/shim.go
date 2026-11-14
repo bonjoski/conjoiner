@@ -110,13 +110,16 @@ func SanitizeChildEnv(environ []string) []string {
 
 // Config configures the transparent MCP transport shim.
 type Config struct {
-	TargetCommand  string
-	TargetArgs     []string
-	AllowedScopes  []string
-	Token          string
-	BrokerPubKey   ed25519.PublicKey
-	MaxMessageSize int64
-	ScrubSecrets   bool
+	TargetCommand   string
+	TargetArgs      []string
+	AllowedScopes   []string
+	Token           string
+	BrokerPubKey    ed25519.PublicKey
+	MaxMessageSize  int64
+	ScrubSecrets    bool
+	EnableTaintGate bool
+	SessionID       string
+	TaintGate       TaintGate
 }
 
 // TransportShim coordinates bidirectional streaming JSON-RPC inspection.
@@ -125,6 +128,7 @@ type TransportShim struct {
 	scopeSet      attenuation.ScopeSet
 	verifiedToken *token.TaskToken
 	sanitizer     *Sanitizer
+	taintGate     TaintGate
 	pendingMu     sync.Mutex
 	pending       map[string]string // maps request ID string to method name
 }
@@ -225,11 +229,21 @@ func NewTransportShim(cfg Config) (*TransportShim, error) {
 		}
 	}
 
+	var tg TaintGate
+	if cfg.EnableTaintGate {
+		if cfg.TaintGate != nil {
+			tg = cfg.TaintGate
+		} else {
+			tg = NewDefaultTaintGate()
+		}
+	}
+
 	return &TransportShim{
 		cfg:           cfg,
 		scopeSet:      scopeSet,
 		verifiedToken: verifiedToken,
 		sanitizer:     NewSanitizer(),
+		taintGate:     tg,
 		pending:       make(map[string]string),
 	}, nil
 }
@@ -524,6 +538,18 @@ func (s *TransportShim) handleInboundLine(line []byte, _ io.Writer, clientOut io
 		if len(params.Arguments) > 0 {
 			if injected, reason := DetectJSONPromptInjection(params.Arguments); injected {
 				writeJSONRPCError(clientOut, msg.ID, ErrCodePromptInjectionDetected, fmt.Sprintf("Conjoiner policy blocked tool call: %s", reason))
+				return false
+			}
+		}
+
+		// 1b. Dynamic Taint Gate: intercept multi-step exfiltration on egress tools
+		if s.taintGate != nil && IsEgressToolName(params.Name) {
+			sessionID := s.cfg.SessionID
+			if sessionID == "" {
+				sessionID = "default"
+			}
+			if allowed, reason := s.taintGate.EvaluateEgress(sessionID, params.Name, params.Arguments); !allowed {
+				writeJSONRPCError(clientOut, msg.ID, ErrCodeTaintViolation, fmt.Sprintf("Conjoiner policy blocked egress: %s", reason))
 				return false
 			}
 		}

@@ -15,6 +15,7 @@ const (
 	ErrCodeScopeDenied             = -32002
 	ErrCodeTokenExpired            = -32003
 	ErrCodePromptInjectionDetected = -32004
+	ErrCodeTaintViolation          = -32005
 )
 
 // JSONRPCMessage represents the standard JSON-RPC 2.0 envelope used by MCP.
