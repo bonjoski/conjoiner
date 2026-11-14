@@ -17,6 +17,7 @@ import (
 	"github.com/bonjoski/conjoiner/pkg/gateway"
 	"github.com/bonjoski/conjoiner/pkg/mandate"
 	"github.com/bonjoski/conjoiner/pkg/mcp"
+	"github.com/bonjoski/conjoiner/pkg/mcp/guard"
 	"github.com/bonjoski/conjoiner/pkg/token"
 	"github.com/bonjoski/conjoiner/pkg/version"
 )
@@ -96,6 +97,8 @@ func main() {
 		handleGateCommand(append([]string{"exec"}, os.Args[2:]...))
 	case "mandate":
 		handleMandateCommand(os.Args[2:])
+	case "mcp":
+		handleMCPCommand(os.Args[2:])
 	case "mcp-shim", "mcp-proxy":
 		handleMCPShimCommand(os.Args[2:])
 	case "version", "--version", "-v":
@@ -124,6 +127,7 @@ Commands:
   dpop      Manage ephemeral DPoP keypairs and proofs
   gate      Deterministic policy gateway execution
   mandate   Compile natural language security mandates into capability scopes
+  mcp       MCP security tools: audit manifests for SSRF/poisoned upstreams
   mcp-shim  Transparent MCP transport shim & DPoP tool gateway
   version   Display Conjoiner version`)
 }
@@ -584,6 +588,84 @@ func handleMCPShimCommand(args []string) {
 	ctx := context.Background()
 	if err := shim.Run(ctx, os.Stdin, os.Stdout, os.Stderr); err != nil && !errors.Is(err, context.Canceled) {
 		fmt.Fprintf(os.Stderr, "MCP shim runtime error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func handleMCPCommand(args []string) {
+	if len(args) < 1 {
+		fmt.Println(`Usage: conjoiner mcp <audit|shim> [flags]`)
+		os.Exit(1)
+	}
+
+	switch args[0] {
+	case "audit":
+		auditCmd := flag.NewFlagSet("mcp audit", flag.ExitOnError)
+		manifestPath := auditCmd.String("manifest", "", "Path to MCP registry manifest JSON file")
+		purge := auditCmd.Bool("purge", false, "Purge detected poisoned or SSRF upstream entries from the manifest")
+		dryRun := auditCmd.Bool("dry-run", false, "Simulate purge without writing changes")
+		outputJSON := auditCmd.Bool("json", false, "Emit audit results as JSON")
+		auditCmd.Parse(args[1:])
+
+		if *manifestPath == "" {
+			fmt.Fprintln(os.Stderr, "Error: --manifest <path> is required")
+			os.Exit(1)
+		}
+
+		auditor := guard.NewRegistryAuditor(nil, nil)
+		ctx := context.Background()
+
+		report, err := auditor.AuditManifest(ctx, *manifestPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Audit failed: %v\n", err)
+			os.Exit(1)
+		}
+
+		if *purge {
+			result, err := auditor.PurgePoisonedEntries(ctx, *manifestPath, *dryRun)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Purge failed: %v\n", err)
+				os.Exit(1)
+			}
+			if *outputJSON {
+				out, _ := json.MarshalIndent(result, "", "  ")
+				fmt.Println(string(out))
+			} else {
+				fmt.Printf("Purge complete for %s (dry-run: %v)\n", result.ManifestPath, result.DryRun)
+				fmt.Printf("Purged entries: %d\n", result.PurgedCount)
+				if result.BackupPath != "" {
+					fmt.Printf("Backup saved to: %s\n", result.BackupPath)
+				}
+			}
+			return
+		}
+
+		if *outputJSON {
+			out, _ := json.MarshalIndent(report, "", "  ")
+			fmt.Println(string(out))
+		} else {
+			fmt.Printf("MCP Registry Manifest Audit: %s\n", report.ManifestPath)
+			fmt.Printf("Total Servers:    %d\n", report.TotalServers)
+			fmt.Printf("Valid Servers:    %d\n", report.ValidServers)
+			fmt.Printf("Poisoned Servers: %d\n", report.PoisonedServers)
+			if len(report.PoisonedEntries) > 0 {
+				fmt.Println("\nPoisoned / SSRF-Vulnerable Upstreams:")
+				for _, entry := range report.PoisonedEntries {
+					ipInfo := ""
+					if entry.IP != "" {
+						ipInfo = fmt.Sprintf(" [%s]", entry.IP)
+					}
+					fmt.Printf("  - %s: %s%s (%s)\n", entry.ServerKey, entry.URL, ipInfo, entry.Reason)
+				}
+				os.Exit(2)
+			} else {
+				fmt.Println("\nManifest is clean: zero SSRF or metadata upstreams detected.")
+			}
+		}
+	case "shim":
+		handleMCPShimCommand(args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown mcp subcommand: %s\n", args[0])
 		os.Exit(1)
 	}
 }
