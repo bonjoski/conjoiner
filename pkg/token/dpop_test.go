@@ -137,3 +137,48 @@ func TestReplayCachePurge(t *testing.T) {
 		t.Errorf("expected 1 entry after purge, got %d", cache.Len())
 	}
 }
+
+func TestDeriveDPoPSubkey(t *testing.T) {
+	rootKey := []byte("super-secret-root-key-32-bytes!!")
+	sessionID := "ses-workstation-alpha-42"
+	epoch := int64(1)
+
+	// 1. Derivation must be deterministic across restarts
+	key1, err := DeriveDPoPSubkey(rootKey, sessionID, epoch)
+	if err != nil {
+		t.Fatalf("Failed to derive DPoP key 1: %v", err)
+	}
+
+	key2, err := DeriveDPoPSubkey(rootKey, sessionID, epoch)
+	if err != nil {
+		t.Fatalf("Failed to derive DPoP key 2: %v", err)
+	}
+
+	if key1.Thumbprint() != key2.Thumbprint() {
+		t.Fatalf("Expected identical thumbprint from deterministic derivation, got %s vs %s", key1.Thumbprint(), key2.Thumbprint())
+	}
+
+	// 2. Different epoch must produce distinct subkey
+	keyEpoch2, err := DeriveDPoPSubkey(rootKey, sessionID, 2)
+	if err != nil {
+		t.Fatalf("Failed to derive epoch 2 key: %v", err)
+	}
+	if key1.Thumbprint() == keyEpoch2.Thumbprint() {
+		t.Fatal("Expected different epoch to produce different thumbprint")
+	}
+
+	// 3. Different sessionID must produce distinct subkey
+	keyOtherSession, err := DeriveDPoPSubkey(rootKey, "ses-other", 1)
+	if err != nil {
+		t.Fatalf("Failed to derive other session key: %v", err)
+	}
+	if key1.Thumbprint() == keyOtherSession.Thumbprint() {
+		t.Fatal("Expected different session to produce different thumbprint")
+	}
+
+	// 4. Short key must fail closed
+	_, err = DeriveDPoPSubkey([]byte("short"), sessionID, 1)
+	if err == nil {
+		t.Fatal("Expected short key < 16 bytes to fail")
+	}
+}

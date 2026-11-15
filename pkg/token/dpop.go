@@ -2,6 +2,7 @@ package token
 
 import (
 	"crypto/ed25519"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -60,6 +61,28 @@ func GenerateDPoPKey() (*DPoPKey, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate ephemeral ed25519 key: %w", err)
 	}
+	return &DPoPKey{
+		PrivateKey: priv,
+		PublicKey:  pub,
+	}, nil
+}
+
+// DeriveDPoPSubkey deterministically derives an ephemeral Ed25519 DPoP keypair
+// from an ambient session root key, sessionID, and epoch counter using HMAC-SHA256.
+// This allows autonomous agents to recover their exact ephemeral DPoP identity
+// across restarts or network hiccups without central IAM re-issuance.
+func DeriveDPoPSubkey(sessionRootKey []byte, sessionID string, epoch int64) (*DPoPKey, error) {
+	if len(sessionRootKey) < 16 {
+		return nil, errors.New("session root key must be at least 16 bytes")
+	}
+	if sessionID == "" {
+		return nil, errors.New("session ID cannot be empty")
+	}
+	h := hmac.New(sha256.New, sessionRootKey)
+	h.Write([]byte(fmt.Sprintf("conjoiner:dpop:v1:%s:%d", sessionID, epoch)))
+	seed := h.Sum(nil)
+	priv := ed25519.NewKeyFromSeed(seed)
+	pub := priv.Public().(ed25519.PublicKey)
 	return &DPoPKey{
 		PrivateKey: priv,
 		PublicKey:  pub,

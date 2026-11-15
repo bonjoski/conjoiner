@@ -32,22 +32,29 @@ type ToolInvocationResponse struct {
 	Error       string                      `json:"error,omitempty"`
 }
 
+var (
+	// ErrTokenRevoked indicates the task token, session, or subject has been explicitly revoked.
+	ErrTokenRevoked = errors.New("task token or session has been revoked")
+)
+
 // Gateway intercepts and deterministically authorizes tool requests.
 type Gateway struct {
-	brokerPubKey ed25519.PublicKey
-	replayCache  token.ReplayCache
-	policyEngine PolicyEngine
-	executor     ToolExecutor
-	ledger       ledger.Ledger
+	brokerPubKey    ed25519.PublicKey
+	replayCache     token.ReplayCache
+	revocationStore token.RevocationStore
+	policyEngine    PolicyEngine
+	executor        ToolExecutor
+	ledger          ledger.Ledger
 }
 
 // GatewayConfig defines dependencies for constructing a Gateway.
 type GatewayConfig struct {
-	BrokerPubKey ed25519.PublicKey
-	ReplayCache  token.ReplayCache
-	PolicyEngine PolicyEngine
-	Executor     ToolExecutor
-	Ledger       ledger.Ledger
+	BrokerPubKey    ed25519.PublicKey
+	ReplayCache     token.ReplayCache
+	RevocationStore token.RevocationStore
+	PolicyEngine    PolicyEngine
+	Executor        ToolExecutor
+	Ledger          ledger.Ledger
 }
 
 // NewGateway constructs a new Policy Gateway instance.
@@ -57,6 +64,9 @@ func NewGateway(cfg GatewayConfig) (*Gateway, error) {
 	}
 	if cfg.ReplayCache == nil {
 		cfg.ReplayCache = token.NewMemoryReplayCache()
+	}
+	if cfg.RevocationStore == nil {
+		cfg.RevocationStore = token.NewMemoryRevocationStore()
 	}
 	if cfg.PolicyEngine == nil {
 		cfg.PolicyEngine = NewDeterministicPolicyEngine()
@@ -73,12 +83,18 @@ func NewGateway(cfg GatewayConfig) (*Gateway, error) {
 	}
 
 	return &Gateway{
-		brokerPubKey: cfg.BrokerPubKey,
-		replayCache:  cfg.ReplayCache,
-		policyEngine: cfg.PolicyEngine,
-		executor:     cfg.Executor,
-		ledger:       cfg.Ledger,
+		brokerPubKey:    cfg.BrokerPubKey,
+		replayCache:     cfg.ReplayCache,
+		revocationStore: cfg.RevocationStore,
+		policyEngine:    cfg.PolicyEngine,
+		executor:        cfg.Executor,
+		ledger:          cfg.Ledger,
 	}, nil
+}
+
+// RevocationStore returns the underlying RevocationStore.
+func (g *Gateway) RevocationStore() token.RevocationStore {
+	return g.revocationStore
 }
 
 // Ledger returns the underlying Cryptographic Intent Ledger.
@@ -107,6 +123,11 @@ func (g *Gateway) Execute(ctx context.Context, req ToolInvocationRequest) (*Tool
 	tok, err := token.ParseAndVerifyToken(req.Token, g.brokerPubKey, now)
 	if err != nil {
 		return nil, fmt.Errorf("token verification failed: %w", err)
+	}
+
+	// 1.5. Validate Token/Session revocation status (fail-closed against spray velocity attacks)
+	if g.revocationStore != nil && g.revocationStore.IsRevoked(tok.JTI, tok.SessionID, tok.Subject) {
+		return nil, ErrTokenRevoked
 	}
 
 	// 2. Validate DPoP Proof

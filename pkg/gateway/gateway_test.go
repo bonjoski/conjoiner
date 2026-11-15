@@ -552,3 +552,75 @@ func TestGatewayPersistentLedgerAudit(t *testing.T) {
 		t.Fatalf("expected 1 receipt in disk WAL, got %d", len(walEntries))
 	}
 }
+
+func TestGatewayExecutionRevokedTokenRejection(t *testing.T) {
+	broker, err := token.NewTokenBroker(token.BrokerConfig{})
+	if err != nil {
+		t.Fatalf("failed to create broker: %v", err)
+	}
+
+	dpopKey, _ := token.GenerateDPoPKey()
+	ctx := context.Background()
+
+	taskToken, tokenJWT, err := broker.IssueRootToken(ctx, token.RootTokenRequest{
+		Subject:        "agent-revocation-test",
+		SessionID:      "session-spray-victim",
+		Scopes:         []string{"tool:exec:git:status"},
+		TTL:            30 * time.Second,
+		DPoPThumbprint: dpopKey.Thumbprint(),
+	})
+	if err != nil {
+		t.Fatalf("failed to issue token: %v", err)
+	}
+
+	mockExec := &MockToolExecutor{
+		ResultFn: func(ctx context.Context, execCtx ExecutionContext) (*ExecutionResult, error) {
+			return &ExecutionResult{ExitCode: 0, Stdout: "clean"}, nil
+		},
+	}
+
+	gw, err := NewGateway(GatewayConfig{
+		BrokerPubKey: broker.PublicKey(),
+		ReplayCache:  broker.ReplayCache(),
+		Executor:     mockExec,
+	})
+	if err != nil {
+		t.Fatalf("failed to create gateway: %v", err)
+	}
+
+	// 1. Initial execution succeeds
+	proof1, _ := dpopKey.CreateProof("EXEC", "tool://git", tokenJWT)
+	resp, err := gw.Execute(ctx, ToolInvocationRequest{
+		Token:     tokenJWT,
+		DPoPProof: proof1,
+		ToolName:  "git",
+		Action:    "status",
+	})
+	if err != nil || resp.Result == nil {
+		t.Fatalf("initial execution failed: %v", err)
+	}
+
+	// 2. Revoke JTI
+	err = gw.RevocationStore().Revoke(taskToken.JTI, time.Now().UTC().Add(30*time.Second))
+	if err != nil {
+		t.Fatalf("failed to revoke JTI: %v", err)
+	}
+
+	// 3. Execution with revoked token must fail with ErrTokenRevoked
+	dpopKey2, _ := token.GenerateDPoPKey()
+	// Re-sign or use fresh proof with new key or same key
+	proof2, _ := dpopKey.CreateProof("EXEC", "tool://git", tokenJWT)
+	_, err = gw.Execute(ctx, ToolInvocationRequest{
+		Token:     tokenJWT,
+		DPoPProof: proof2,
+		ToolName:  "git",
+		Action:    "status",
+	})
+	if err == nil {
+		t.Fatal("expected execution to fail for revoked token, got nil")
+	}
+	if !errors.Is(err, ErrTokenRevoked) {
+		t.Fatalf("expected ErrTokenRevoked, got: %v", err)
+	}
+	_ = dpopKey2
+}
