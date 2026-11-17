@@ -1,5 +1,9 @@
 # Conjoiner (`bonjoski/conjoiner`)
 
+[![CI](https://github.com/bonjoski/conjoiner/actions/workflows/ci.yml/badge.svg)](https://github.com/bonjoski/conjoiner/actions/workflows/ci.yml)
+[![SLSA 2](https://slsa.dev/images/gh-badge-level2.svg)](https://slsa.dev)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
 > **Sovereign Agentic IAM Broker & Policy Gateway**  
 > Implementing the NIST 10 Design Tenets for Agentic Non-Human Identity (NHI)
 
@@ -72,6 +76,22 @@ conjoiner token attenuate --parent "$TOKEN_JSON" --requested-scope "fs:read:/tmp
 conjoiner token attenuate --parent "$TOKEN_JSON" --requested-scope "fs:write:/etc"
 # Exits with Code 1:
 # Error: requested scope violates attenuation invariant (not a strict subset): superset permission expansion denied
+```
+
+---
+
+## SLSA Provenance & Verification
+
+Conjoiner complies with the **SLSA v1.0** specification.
+
+Verify provenance with GitHub CLI:
+```bash
+gh attestation verify conjoiner --repo bonjoski/conjoiner
+```
+
+Or verify offline using Soulcaster:
+```bash
+soulcaster verify --attestation conjoiner.intoto.jsonl bin/conjoiner
 ```
 
 ---
