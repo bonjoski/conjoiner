@@ -465,6 +465,7 @@ func handleGateCommand(args []string) {
 	case "exec":
 		execCmd := flag.NewFlagSet("gate exec", flag.ExitOnError)
 		tokFlag := execCmd.String("token", "", "Task token JWT")
+		passFlag := execCmd.String("pass", "", "AgentPass JWT string or JSON (auto-mints 30s token & evaluates hardware gate)")
 		dpopFlag := execCmd.String("dpop", "", "DPoP proof JWT")
 		toolFlag := execCmd.String("tool", "", "Tool name (e.g. echo, git)")
 		actionFlag := execCmd.String("action", "", "Tool action (e.g. print, status)")
@@ -477,9 +478,9 @@ func handleGateCommand(args []string) {
 
 		remainingArgs := execCmd.Args()
 
-		if *tokFlag == "" || *toolFlag == "" || *actionFlag == "" {
-			fmt.Fprintln(os.Stderr, "Usage: conjoiner gate exec --token <jwt> --dpop <proof> --tool <tool> --action <action> [--workflow-manifest <path>] [-- <args...>]")
-			fmt.Fprintln(os.Stderr, "Error: --token, --tool, and --action are required")
+		if *toolFlag == "" || *actionFlag == "" || (*tokFlag == "" && *passFlag == "") {
+			fmt.Fprintln(os.Stderr, "Usage: conjoiner gate exec (--pass <agentpass> | --token <jwt> --dpop <proof>) --tool <tool> --action <action> [-- <args...>]")
+			fmt.Fprintln(os.Stderr, "Error: --tool, --action, and either --pass or (--token and --dpop) are required")
 			os.Exit(1)
 		}
 
@@ -487,6 +488,74 @@ func handleGateCommand(args []string) {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
+		}
+
+		now := time.Now()
+
+		if *passFlag != "" && *tokFlag == "" {
+			passJWT := extractTokenString(*passFlag, "agentpass_token")
+			pass, err := agentpass.Verify(passJWT, keys.PublicKey, now)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error verifying AgentPass: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Pre-flight scope check: fail fast
+			toolAction := fmt.Sprintf("tool:exec:%s", *toolFlag)
+			if *actionFlag != "" {
+				toolAction = fmt.Sprintf("tool:exec:%s:%s", *toolFlag, *actionFlag)
+			}
+			permSpecific, _ := pass.Permits(toolAction)
+			permGeneric, _ := pass.Permits(fmt.Sprintf("tool:exec:%s", *toolFlag))
+			permActionOnly, _ := pass.Permits(*actionFlag)
+			if !permSpecific && !permGeneric && !permActionOnly {
+				fmt.Fprintf(os.Stderr, "Gateway Rejection: tool '%s' (action: '%s') is not permitted under AgentPass scope [%s]\n",
+					*toolFlag, *actionFlag, strings.Join(pass.Scope, ", "))
+				os.Exit(1)
+			}
+
+			// Hardware presence / biometric step-up check
+			gate := agentpass.NewHardwareGate()
+			ctx := context.Background()
+			if err := gate.CheckAndAuthorize(ctx, pass, toolAction); err != nil {
+				fmt.Fprintf(os.Stderr, "Hardware gate authorization failed: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Generate ephemeral DPoP keypair for this tool execution
+			dpopKey, err := token.GenerateDPoPKey()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error generating tool DPoP key: %v\n", err)
+				os.Exit(1)
+			}
+
+			mintPass := *pass
+			mintPass.DPoPThumbprint = dpopKey.Thumbprint()
+
+			actionToMint := toolAction
+			if permSpecific {
+				actionToMint = toolAction
+			} else if permGeneric {
+				actionToMint = fmt.Sprintf("tool:exec:%s", *toolFlag)
+			} else if permActionOnly {
+				actionToMint = *actionFlag
+			}
+
+			_, signedTok, err := agentpass.MintToolToken(&mintPass, actionToMint, keys.PrivateKey, now)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error minting tool execution token: %v\n", err)
+				os.Exit(1)
+			}
+
+			proof, err := dpopKey.CreateProof("EXEC", fmt.Sprintf("tool://%s", *toolFlag), signedTok)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error creating DPoP proof: %v\n", err)
+				os.Exit(1)
+			}
+			dpopKey.Zeroize()
+
+			*tokFlag = signedTok
+			*dpopFlag = proof
 		}
 
 		var workflowManifest *attenuation.WorkflowManifest
@@ -806,8 +875,13 @@ func extractTokenString(input, key string) string {
 
 func handleAgentPassCommand(args []string) {
 	if len(args) < 1 {
-		fmt.Println(`Usage: conjoiner agentpass <issue|attenuate|verify|mint-token> [flags]`)
+		fmt.Println(`Usage: conjoiner agentpass <issue|attenuate|verify|mint-token|exec> [flags]`)
 		os.Exit(1)
+	}
+
+	if args[0] == "exec" {
+		handleGateCommand(append([]string{"exec"}, args[1:]...))
+		return
 	}
 
 	keys, err := getOrGenerateBrokerKeys()

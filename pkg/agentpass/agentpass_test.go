@@ -316,3 +316,41 @@ func TestHardwareGate_AmortizedLease(t *testing.T) {
 		t.Fatalf("expected foreign session without lease to be challenged/denied")
 	}
 }
+
+func BenchmarkAgentPass_MintToolToken(b *testing.B) {
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	now := time.Now()
+
+	opts := IssueOptions{
+		AgentID:         "agent:bench",
+		HumanSupervisor: "dev@bonjo.dev",
+		Scope:           []string{"git:status", "tool:exec:cat"},
+	}
+
+	pass, _, _ := IssueRootPass(opts, priv, now)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _, _ = MintToolToken(pass, "git:status", priv, now)
+	}
+}
+
+func BenchmarkHardwareGate_AmortizedLeaseCheck(b *testing.B) {
+	gate := NewHardwareGate()
+	gate.SetLeaseTTL(10 * time.Minute)
+
+	pass := &AgentPass{
+		AgentID:         "agent:bench",
+		SessionID:       "sess-bench-lease",
+		HumanSupervisor: "dev@bonjo.dev",
+	}
+
+	now := time.Now()
+	gate.grantLease(pass.SessionID, RiskHigh, now)
+	ctx := context.Background()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = gate.CheckAndAuthorize(ctx, pass, "git:commit")
+	}
+}
