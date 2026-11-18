@@ -109,6 +109,18 @@ conjoiner agentpass mint-token \
 
 ---
 
+## 💡 Core Use Cases & Recipes
+
+Every primary developer use case is backed by dedicated, copy-pasteable recipes in [**`docs/use-cases/`**](docs/use-cases/README.md):
+
+| Use Case | Scenario & Quick Recipe | Full Guide |
+| :--- | :--- | :--- |
+| **Ephemeral DPoP Delegation** | Issue 30s TTL Ed25519-bound capability tokens to subagents:<br/>`conjoiner token issue --subagent worker-1 --ttl 30s` | [Guide](docs/use-cases/01-ephemeral-dpop-delegation.md) |
+| **Path-Restricted Attenuation** | Monotonically restrict subagent write capabilities to a subfolder:<br/>`conjoiner token attenuate --token "$PARENT" --restrict-path "./src/components"` | [Guide](docs/use-cases/02-path-restricted-attenuation.md) |
+| **Cryptographic Intent Ledger** | Maintain and verify an immutable Merkle audit trail of all subagent actions:<br/>`conjoiner audit --verify` | [Guide](docs/use-cases/03-cryptographic-intent-ledger.md) |
+
+---
+
 ## SLSA Provenance & Verification
 
 Conjoiner complies with the **SLSA v1.0** specification.
