@@ -194,3 +194,167 @@ func TestCNJ02_ShardedBoundedReplayCacheConcurrency(t *testing.T) {
 		t.Fatal("CNJ-02 FAILED: bounded replay cache did not enforce per-shard capacity limit")
 	}
 }
+
+// TestAdversarial_WorkloadIdentityMintingAndSPIFFEBinding asserts workload identity minting,
+// SPIFFE ID subject format, DPoP confirmation binding, RFC 4122 v4 UUID JTI, and strict 30s TTL.
+func TestAdversarial_WorkloadIdentityMintingAndSPIFFEBinding(t *testing.T) {
+	broker, err := NewTokenBroker(BrokerConfig{})
+	if err != nil {
+		t.Fatalf("failed initializing broker: %v", err)
+	}
+
+	dpopKey, err := GenerateDPoPKey()
+	if err != nil {
+		t.Fatalf("failed generating dpop key: %v", err)
+	}
+
+	sessionID := "agent-subagent-88a91c"
+	scopes := []string{"git:read", "issue:read", "tool:exec:safe_scan"}
+
+	tok, tokenJWT, err := MintWorkloadIdentity(sessionID, dpopKey.PublicKey, scopes, broker.PrivateKey())
+	if err != nil {
+		t.Fatalf("MintWorkloadIdentity failed: %v", err)
+	}
+
+	// 1. Verify SPIFFE Subject format
+	expectedSub := "spiffe://bonjo.dev/agent/" + sessionID
+	if tok.Subject != expectedSub {
+		t.Fatalf("expected subject %q, got %q", expectedSub, tok.Subject)
+	}
+	if tok.SessionID != sessionID {
+		t.Fatalf("expected session ID %q, got %q", sessionID, tok.SessionID)
+	}
+
+	// 2. Verify depth 0
+	if tok.Depth != 0 {
+		t.Fatalf("expected depth 0, got %d", tok.Depth)
+	}
+
+	// 3. Verify strict 30s TTL window
+	ttlWindow := time.Duration(tok.ExpiresAt-tok.IssuedAt) * time.Second
+	if ttlWindow != DefaultTTL {
+		t.Fatalf("expected strict %v TTL, got %v", DefaultTTL, ttlWindow)
+	}
+
+	// 4. Verify RFC 4122 v4 UUID JTI format
+	if len(tok.JTI) != 36 || tok.JTI[8] != '-' || tok.JTI[13] != '-' || tok.JTI[18] != '-' || tok.JTI[23] != '-' {
+		t.Fatalf("expected UUID format for JTI, got: %s", tok.JTI)
+	}
+	if tok.JTI[14] != '4' {
+		t.Fatalf("expected UUID version 4 (byte 14 == '4'), got JTI: %s", tok.JTI)
+	}
+
+	// 5. Verify DPoP confirmation thumbprint
+	if !tok.VerifyDPoPBinding(dpopKey.Thumbprint()) {
+		t.Fatalf("DPoP confirmation binding thumbprint mismatch: tok.CNF=%s, dpopThumbprint=%s", tok.CNF.JKT, dpopKey.Thumbprint())
+	}
+
+	// 6. Verify cryptographic token signature and claims
+	parsedTok, err := ParseAndVerifyToken(tokenJWT, broker.PublicKey(), time.Now().UTC())
+	if err != nil {
+		t.Fatalf("ParseAndVerifyToken failed: %v", err)
+	}
+	if parsedTok.JTI != tok.JTI || parsedTok.Subject != expectedSub {
+		t.Fatalf("parsed token claim mismatch: %+v", parsedTok)
+	}
+
+	// 7. Validation errors on invalid inputs
+	if _, _, err := MintWorkloadIdentity("", dpopKey.PublicKey, scopes, broker.PrivateKey()); err == nil {
+		t.Fatal("expected error with empty sessionID, got nil")
+	}
+	if _, _, err := MintWorkloadIdentity(sessionID, nil, scopes, broker.PrivateKey()); err == nil {
+		t.Fatal("expected error with nil public key, got nil")
+	}
+	if _, _, err := MintWorkloadIdentity(sessionID, dpopKey.PublicKey, scopes, nil); err == nil {
+		t.Fatal("expected error with nil private key, got nil")
+	}
+}
+
+// TestAdversarial_WorkloadIdentity30STTLExpiration asserts monotonic expiration at 30 seconds.
+func TestAdversarial_WorkloadIdentity30STTLExpiration(t *testing.T) {
+	broker, err := NewTokenBroker(BrokerConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dpopKey, _ := GenerateDPoPKey()
+
+	tok, tokenJWT, err := MintWorkloadIdentity("sess-exp-test", dpopKey.PublicKey, []string{"read"}, broker.PrivateKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	issuedTime := time.Unix(tok.IssuedAt, 0).UTC()
+
+	// At 10s: still valid
+	if _, err := ParseAndVerifyToken(tokenJWT, broker.PublicKey(), issuedTime.Add(10*time.Second)); err != nil {
+		t.Fatalf("expected token to be valid at +10s, got: %v", err)
+	}
+
+	// At 29s: still valid
+	if _, err := ParseAndVerifyToken(tokenJWT, broker.PublicKey(), issuedTime.Add(29*time.Second)); err != nil {
+		t.Fatalf("expected token to be valid at +29s, got: %v", err)
+	}
+
+	// At 31s (past 30s TTL): MUST fail with ErrExpiredToken
+	_, err = ParseAndVerifyToken(tokenJWT, broker.PublicKey(), issuedTime.Add(31*time.Second))
+	if !errors.Is(err, ErrExpiredToken) {
+		t.Fatalf("expected ErrExpiredToken at +31s, got: %v", err)
+	}
+}
+
+// TestAdversarial_InstantJTIRevocationAndForensicReason asserts sub-minute instant revocation.
+func TestAdversarial_InstantJTIRevocationAndForensicReason(t *testing.T) {
+	broker, err := NewTokenBroker(BrokerConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dpopKey, _ := GenerateDPoPKey()
+	sessionID := "sess-instant-revoke"
+
+	tok, tokenJWT, err := MintWorkloadIdentity(sessionID, dpopKey.PublicKey, []string{"git:push"}, broker.PrivateKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	revStore := NewMemoryRevocationStore()
+	now := time.Now().UTC()
+
+	// 1. Initial verification succeeds
+	if _, err := ParseAndVerifyTokenWithRevocation(tokenJWT, broker.PublicKey(), now, revStore); err != nil {
+		t.Fatalf("initial verification should succeed: %v", err)
+	}
+
+	// 2. Instant JTI revocation with reason
+	reason := "Argus tripwire: detected unauthorized slopsquatted package execution"
+	exp := now.Add(24 * time.Hour)
+	if err := revStore.RevokeWithReason(tok.JTI, exp, reason); err != nil {
+		t.Fatalf("RevokeWithReason failed: %v", err)
+	}
+
+	// 3. Verification immediately fails closed with ErrTokenRevoked
+	_, err = ParseAndVerifyTokenWithRevocation(tokenJWT, broker.PublicKey(), now, revStore)
+	if !errors.Is(err, ErrTokenRevoked) {
+		t.Fatalf("expected ErrTokenRevoked after JTI revocation, got: %v", err)
+	}
+
+	// 4. Other token in different session is not revoked
+	otherTok, otherJWT, err := MintWorkloadIdentity("other-sess", dpopKey.PublicKey, []string{"read"}, broker.PrivateKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if otherTok.JTI == tok.JTI {
+		t.Fatal("expected distinct JTIs")
+	}
+	if _, err := ParseAndVerifyTokenWithRevocation(otherJWT, broker.PublicKey(), now, revStore); err != nil {
+		t.Fatalf("unrelated token should not be revoked: %v", err)
+	}
+
+	// 5. Session-wide revocation also revokes all tokens for that session
+	if err := revStore.RevokeSession("other-sess", exp); err != nil {
+		t.Fatalf("RevokeSession failed: %v", err)
+	}
+	_, err = ParseAndVerifyTokenWithRevocation(otherJWT, broker.PublicKey(), now, revStore)
+	if !errors.Is(err, ErrTokenRevoked) {
+		t.Fatalf("expected ErrTokenRevoked after session revocation, got: %v", err)
+	}
+}

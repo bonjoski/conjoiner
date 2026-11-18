@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -15,6 +16,14 @@ import (
 var (
 	roleMarkerRegex = regexp.MustCompile(`(?i)(</?(?:system|admin|instruction|developer|prompt|context|assistant|user)>|\[/?(?:INSTRUCTION|SYSTEM|ADMIN|DEVELOPER)\]|<<SYS>>|<</SYS>>|<\|(?:im_start|im_end|system|user|assistant)\|>)`)
 	overrideRegex   = regexp.MustCompile(`(?i)(?:ignore\s+(?:all\s+)?(?:previous|prior)\s+instructions|system\s+override|disregard\s+(?:all\s+)?(?:prior|previous)\s+instructions|you\s+are\s+now\s+in\s+developer\s+mode|override\s+security\s+instructions)`)
+
+	secretRefRegex      = regexp.MustCompile(`\[SECRET_REF_[0-9a-fA-F]{16}\]`)
+	vendorSecretRegexes = []*regexp.Regexp{
+		regexp.MustCompile(`\bglpat-[0-9a-zA-Z_\-]{16,}\b`),
+		regexp.MustCompile(`\bgh[pousr]_[a-zA-Z0-9]{20,}\b`),
+		regexp.MustCompile(`\bxox[baprs]-[0-9a-zA-Z\-]{10,}\b`),
+		regexp.MustCompile(`-----BEGIN (?:[A-Z0-9_-]+ )?PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9_-]+ )?PRIVATE KEY-----|$)`),
+	}
 )
 
 // Sanitizer provides semantic input screening and secret redaction.
@@ -22,10 +31,16 @@ type Sanitizer struct {
 	shieldEngine *shield.Engine
 }
 
-// NewSanitizer constructs an active sanitizer.
+// NewSanitizer constructs an active sanitizer enriched with vendor patterns.
 func NewSanitizer() *Sanitizer {
+	cfg := shield.DefaultConfig()
+	// Enrich built-in shield patterns with GitLab personal access tokens
+	cfg.Patterns = append(cfg.Patterns, shield.SecretPattern{
+		Name:  "GitLab Personal Access Token",
+		Regex: regexp.MustCompile(`\bglpat-[0-9a-zA-Z_\-]{20,}\b`),
+	})
 	return &Sanitizer{
-		shieldEngine: shield.NewEngine(shield.DefaultConfig()),
+		shieldEngine: shield.NewEngine(cfg),
 	}
 }
 
@@ -139,15 +154,92 @@ func scanDecodedJSONStrings(v any) (bool, string) {
 	return false, ""
 }
 
-// ScrubSecrets applies Shield Shannon entropy redaction to tool output.
-func (s *Sanitizer) ScrubSecrets(payload []byte) ([]byte, bool) {
-	if s.shieldEngine == nil {
-		return payload, false
+func (s *Sanitizer) scrubText(text string) (string, bool) {
+	modified := false
+
+	// 1. Direct vendor credential scrubbing sweep (GitLab glpat-, GitHub ghp_, Slack xoxb-, SSH/PEM private keys)
+	for _, reg := range vendorSecretRegexes {
+		if reg.MatchString(text) {
+			text = reg.ReplaceAllString(text, "[REDACTED_SECRET]")
+			modified = true
+		}
 	}
+
+	// 2. Pass through Shield engine (handles high entropy tokens, known keys, and standard patterns with [SECRET_REF_...])
+	if s.shieldEngine != nil {
+		redacted, tm, err := s.shieldEngine.Redact(text)
+		if err == nil && tm != nil && tm.Count() > 0 {
+			text = redacted
+			modified = true
+		}
+	}
+
+	return text, modified
+}
+
+func (s *Sanitizer) scrubJSONValue(val *any) bool {
+	if val == nil || *val == nil {
+		return false
+	}
+	switch v := (*val).(type) {
+	case string:
+		scrubbed, mod := s.scrubText(v)
+		if mod {
+			*val = scrubbed
+			return true
+		}
+		return false
+	case []any:
+		modified := false
+		for i := range v {
+			if s.scrubJSONValue(&v[i]) {
+				modified = true
+			}
+		}
+		return modified
+	case map[string]any:
+		modified := false
+		for k, child := range v {
+			// Do not scrub protocol metadata envelope fields like _meta
+			if k == "_meta" {
+				continue
+			}
+			childVal := child
+			if s.scrubJSONValue(&childVal) {
+				v[k] = childVal
+				modified = true
+			}
+		}
+		return modified
+	default:
+		return false
+	}
+}
+
+// ScrubSecrets applies Shield Shannon entropy redaction and vendor pattern scrubbing to tool output,
+// ensuring raw secrets (e.g. glpat-, ghp_, xoxb-, BEGIN OPENSSH PRIVATE KEY) are replaced with [REDACTED_SECRET].
+func (s *Sanitizer) ScrubSecrets(payload []byte) ([]byte, bool) {
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
+		decoder := json.NewDecoder(bytes.NewReader(trimmed))
+		decoder.UseNumber()
+		var jsonVal any
+		if err := decoder.Decode(&jsonVal); err == nil {
+			modified := s.scrubJSONValue(&jsonVal)
+			if modified {
+				res, mErr := json.Marshal(jsonVal)
+				if mErr == nil {
+					return res, true
+				}
+			}
+			return payload, false
+		}
+	}
+
 	text := string(payload)
-	redacted, tm, err := s.shieldEngine.Redact(text)
-	if err == nil && tm != nil && tm.Count() > 0 {
-		return []byte(redacted), true
+	scrubbed, modified := s.scrubText(text)
+	if modified {
+		return []byte(scrubbed), true
 	}
 	return payload, false
 }

@@ -110,27 +110,41 @@ func SanitizeChildEnv(environ []string) []string {
 
 // Config configures the transparent MCP transport shim.
 type Config struct {
-	TargetCommand   string
-	TargetArgs      []string
-	AllowedScopes   []string
-	Token           string
-	BrokerPubKey    ed25519.PublicKey
-	MaxMessageSize  int64
-	ScrubSecrets    bool
-	EnableTaintGate bool
-	SessionID       string
-	TaintGate       TaintGate
+	TargetCommand           string
+	TargetArgs              []string
+	AllowedScopes           []string
+	Token                   string
+	BrokerPubKey            ed25519.PublicKey
+	MaxMessageSize          int64
+	ScrubSecrets            bool
+	EnableTaintGate         bool
+	SessionID               string
+	TaintGate               TaintGate
+	RequireHardwarePresence bool
+	PresenceChecker         PresenceChecker
+	WorkflowManifest        *attenuation.WorkflowManifest
+	WorkflowManifestPath    string
+	EnforceWorkflowManifest bool
+	AuditLogPath            string
+	RevocationStore         token.RevocationStore
+	CorrelationJTI          string
 }
 
 // TransportShim coordinates bidirectional streaming JSON-RPC inspection.
 type TransportShim struct {
-	cfg           Config
-	scopeSet      attenuation.ScopeSet
-	verifiedToken *token.TaskToken
-	sanitizer     *Sanitizer
-	taintGate     TaintGate
-	pendingMu     sync.Mutex
-	pending       map[string]string // maps request ID string to method name
+	cfg                   Config
+	scopeSet              attenuation.ScopeSet
+	parentScopeSet        attenuation.ScopeSet
+	workflowManifest      *attenuation.WorkflowManifest
+	presenceChecker       PresenceChecker
+	verifiedToken         *token.TaskToken
+	revocationStore       token.RevocationStore
+	activeCorrelationJTI  string
+	pendingCorrelationJTI map[string]string
+	sanitizer             *Sanitizer
+	taintGate             TaintGate
+	pendingMu             sync.Mutex
+	pending               map[string]string // maps request ID string to method name
 }
 
 func resolveAmbientBrokerPubKey() ed25519.PublicKey {
@@ -229,6 +243,35 @@ func NewTransportShim(cfg Config) (*TransportShim, error) {
 		}
 	}
 
+	parentScopeSet := scopeSet
+
+	// Enforce workflow manifest if configured
+	if cfg.EnforceWorkflowManifest && cfg.WorkflowManifest == nil && strings.TrimSpace(cfg.WorkflowManifestPath) == "" {
+		return nil, attenuation.ErrManifestRequired
+	}
+
+	var wm *attenuation.WorkflowManifest
+	if cfg.WorkflowManifest != nil {
+		wm = cfg.WorkflowManifest
+	} else if strings.TrimSpace(cfg.WorkflowManifestPath) != "" {
+		loaded, err := attenuation.LoadWorkflowManifest(cfg.WorkflowManifestPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed loading workflow manifest: %w", err)
+		}
+		wm = loaded
+	}
+
+	if wm != nil {
+		effective, err := wm.EffectiveScope(parentScopeSet)
+		if err != nil {
+			return nil, fmt.Errorf("failed evaluating workflow scope attenuation: %w", err)
+		}
+		if effective.IsEmpty() {
+			return nil, fmt.Errorf("%w: workflow manifest permitted scopes have empty intersection with parent scopes", ErrMissingAuthorization)
+		}
+		scopeSet = effective
+	}
+
 	var tg TaintGate
 	if cfg.EnableTaintGate {
 		if cfg.TaintGate != nil {
@@ -238,14 +281,46 @@ func NewTransportShim(cfg Config) (*TransportShim, error) {
 		}
 	}
 
+	var presenceChecker PresenceChecker
+	if cfg.RequireHardwarePresence {
+		if cfg.PresenceChecker != nil {
+			presenceChecker = cfg.PresenceChecker
+		} else {
+			presenceChecker = NewDefaultPresenceChecker()
+		}
+	}
+
+	revStore := cfg.RevocationStore
+	if revStore == nil {
+		revStore = token.DefaultRevocationStore
+	}
+
+	corrJTI := cfg.CorrelationJTI
+	if corrJTI == "" && verifiedToken != nil {
+		corrJTI = verifiedToken.JTI
+	}
+
 	return &TransportShim{
-		cfg:           cfg,
-		scopeSet:      scopeSet,
-		verifiedToken: verifiedToken,
-		sanitizer:     NewSanitizer(),
-		taintGate:     tg,
-		pending:       make(map[string]string),
+		cfg:                   cfg,
+		scopeSet:              scopeSet,
+		parentScopeSet:        parentScopeSet,
+		workflowManifest:      wm,
+		presenceChecker:       presenceChecker,
+		verifiedToken:         verifiedToken,
+		revocationStore:       revStore,
+		activeCorrelationJTI:  corrJTI,
+		pendingCorrelationJTI: make(map[string]string),
+		sanitizer:             NewSanitizer(),
+		taintGate:             tg,
+		pending:               make(map[string]string),
 	}, nil
+}
+
+// ActiveCorrelationJTI returns the currently tracked correlation JTI.
+func (s *TransportShim) ActiveCorrelationJTI() string {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	return s.activeCorrelationJTI
 }
 
 // Run executes the target command subprocess and transparently pipes stdin/stdout through security filters.
@@ -465,6 +540,16 @@ func hasDuplicateJSONKeys(data []byte) bool {
 	}
 }
 
+// HandleInboundLine evaluates and filters an inbound JSON-RPC message.
+func (s *TransportShim) HandleInboundLine(line []byte, serverIn io.Writer, clientOut io.Writer) bool {
+	return s.handleInboundLine(line, serverIn, clientOut)
+}
+
+// HandleOutboundLine inspects, tags trace metadata, and sanitizes an outbound JSON-RPC message.
+func (s *TransportShim) HandleOutboundLine(line []byte) []byte {
+	return s.handleOutboundLine(line)
+}
+
 // handleInboundLine checks permissions and prompt injection on inbound client messages.
 // Fails closed (returns false and writes JSON-RPC error) on batch arrays, malformed JSON, or policy violations.
 func (s *TransportShim) handleInboundLine(line []byte, _ io.Writer, clientOut io.Writer) bool {
@@ -505,10 +590,39 @@ func (s *TransportShim) handleInboundLine(line []byte, _ io.Writer, clientOut io
 		return false
 	}
 
+	// Enforce live token revocation when configured with a verified TaskToken
+	if s.verifiedToken != nil && s.revocationStore != nil && s.revocationStore.IsRevoked(s.verifiedToken.JTI, s.verifiedToken.SessionID, s.verifiedToken.Subject) {
+		writeJSONRPCError(clientOut, msg.ID, ErrCodePolicyViolation, "Conjoiner task token has been revoked")
+		return false
+	}
+
+	reqJTI := s.activeCorrelationJTI
+	if len(msg.Params) > 0 {
+		var metaHolder struct {
+			Meta struct {
+				JTI            string `json:"jti"`
+				CorrelationJTI string `json:"X-Correlation-JTI"`
+			} `json:"_meta"`
+		}
+		if err := json.Unmarshal(msg.Params, &metaHolder); err == nil {
+			if metaHolder.Meta.CorrelationJTI != "" {
+				reqJTI = metaHolder.Meta.CorrelationJTI
+			} else if metaHolder.Meta.JTI != "" {
+				reqJTI = metaHolder.Meta.JTI
+			}
+		}
+	}
+	if reqJTI != "" {
+		s.activeCorrelationJTI = reqJTI
+	}
+
 	idStr := string(msg.ID)
 	if idStr != "" && msg.Method != "" {
 		s.pendingMu.Lock()
 		s.pending[idStr] = msg.Method
+		if reqJTI != "" {
+			s.pendingCorrelationJTI[idStr] = reqJTI
+		}
 		s.pendingMu.Unlock()
 	}
 
@@ -528,6 +642,37 @@ func (s *TransportShim) handleInboundLine(line []byte, _ io.Writer, clientOut io
 		if err := json.Unmarshal(paramsTrim, &params); err != nil || strings.TrimSpace(params.Name) == "" {
 			writeJSONRPCError(clientOut, msg.ID, ErrCodeInvalidParams, "Invalid tools/call parameters: tool name is required")
 			return false
+		}
+
+		// 0a. Validate Token/Session revocation status on tool dispatch
+		if s.revocationStore != nil {
+			checkJTI := s.activeCorrelationJTI
+			checkSID := s.cfg.SessionID
+			checkSub := ""
+			if s.verifiedToken != nil {
+				checkJTI = s.verifiedToken.JTI
+				checkSID = s.verifiedToken.SessionID
+				checkSub = s.verifiedToken.Subject
+			}
+			if s.revocationStore.IsRevoked(checkJTI, checkSID, checkSub) {
+				writeJSONRPCError(clientOut, msg.ID, ErrCodePolicyViolation,
+					"Conjoiner policy blocked tool call: task token has been revoked")
+				return false
+			}
+		}
+
+		// 0b. Zero-Background-Authority: Hardware Presence Check
+		if s.cfg.RequireHardwarePresence {
+			checker := s.presenceChecker
+			if checker == nil {
+				checker = NewDefaultPresenceChecker()
+			}
+			if err := checker.CheckPresence(context.Background()); err != nil {
+				LogPresenceRejection(s.cfg.AuditLogPath, params.Name, s.cfg.SessionID, err)
+				writeJSONRPCError(clientOut, msg.ID, ErrCodePolicyViolation,
+					"Zero-Background-Authority: User presence failed / locked")
+				return false
+			}
 		}
 
 		// 1. Semantic firewall: check tool name and arguments (raw + decoded JSON strings) for prompt injection
@@ -554,10 +699,54 @@ func (s *TransportShim) handleInboundLine(line []byte, _ io.Writer, clientOut io
 			}
 		}
 
-		// 2. Monotonic scope attenuation check (fail closed on parse errors!)
-		toolScope := fmt.Sprintf("tool:exec:%s", params.Name)
-		reqScope, err := attenuation.ParseScope(toolScope)
-		if err != nil || !s.scopeSet.Contains(reqScope) {
+		// 2. Monotonic scope attenuation check
+		candidateScopes := extractToolCandidateScopes(params.Name)
+
+		// 2a. If workflow manifest is configured, check mutating operation gating
+		if s.workflowManifest != nil {
+			var authErr error
+			hasMutating := false
+			for _, cand := range candidateScopes {
+				if attenuation.IsStateMutating(cand) {
+					hasMutating = true
+					if err := s.workflowManifest.AuthorizeOperation(s.parentScopeSet, cand); err != nil {
+						authErr = err
+						break
+					}
+				}
+			}
+			if !hasMutating && len(candidateScopes) > 0 {
+				authorized := false
+				for _, cand := range candidateScopes {
+					if err := s.workflowManifest.AuthorizeOperation(s.parentScopeSet, cand); err == nil {
+						authorized = true
+						break
+					} else {
+						authErr = err
+					}
+				}
+				if authorized {
+					authErr = nil
+				}
+			}
+			if authErr != nil {
+				writeJSONRPCError(clientOut, msg.ID, ErrCodeScopeDenied,
+					fmt.Sprintf("Monotonic scope attenuation denied tool invocation: %v", authErr))
+				return false
+			}
+		}
+
+		// 2b. Verify coverage by active effective scopeSet
+		authorized := false
+		for _, cand := range candidateScopes {
+			if s.scopeSet.Contains(cand) {
+				authorized = true
+				break
+			}
+		}
+
+		if !authorized {
+			toolScope := fmt.Sprintf("tool:exec:%s", params.Name)
 			writeJSONRPCError(clientOut, msg.ID, ErrCodeScopeDenied,
 				fmt.Sprintf("Monotonic scope attenuation denied tool invocation: %s (required: %s)", params.Name, toolScope))
 			return false
@@ -620,11 +809,17 @@ func (s *TransportShim) handleOutboundLine(line []byte) []byte {
 
 	idStr := string(msg.ID)
 	var method string
+	var corrJTI string
 	if idStr != "" {
 		s.pendingMu.Lock()
 		method = s.pending[idStr]
+		corrJTI = s.pendingCorrelationJTI[idStr]
 		delete(s.pending, idStr)
+		delete(s.pendingCorrelationJTI, idStr)
 		s.pendingMu.Unlock()
+	}
+	if corrJTI == "" {
+		corrJTI = s.activeCorrelationJTI
 	}
 
 	// 1. If response to tools/list, filter out unauthorized tools
@@ -648,7 +843,26 @@ func (s *TransportShim) handleOutboundLine(line []byte) []byte {
 		}
 	}
 
-	// 2. Secret Redaction on tool outputs
+	// 2. Outbound trace header (X-Correlation-JTI) injection into _meta for result objects
+	if corrJTI != "" && len(msg.Result) > 0 && bytes.HasPrefix(bytes.TrimSpace(msg.Result), []byte("{")) {
+		var resObj map[string]any
+		if err := json.Unmarshal(msg.Result, &resObj); err == nil {
+			metaMap, ok := resObj["_meta"].(map[string]any)
+			if !ok {
+				metaMap = make(map[string]any)
+			}
+			metaMap["X-Correlation-JTI"] = corrJTI
+			resObj["_meta"] = metaMap
+			if newResultBytes, err := json.Marshal(resObj); err == nil {
+				msg.Result = newResultBytes
+				if newMsgBytes, err := json.Marshal(msg); err == nil {
+					line = newMsgBytes
+				}
+			}
+		}
+	}
+
+	// 3. Secret Redaction on tool outputs
 	if s.cfg.ScrubSecrets && s.sanitizer != nil {
 		scrubbed, modified := s.sanitizer.ScrubSecrets(line)
 		if modified {
@@ -658,3 +872,49 @@ func (s *TransportShim) handleOutboundLine(line []byte) []byte {
 
 	return line
 }
+
+// extractToolCandidateScopes computes structured candidate scopes for an MCP tool name.
+func extractToolCandidateScopes(toolName string) []attenuation.Scope {
+	var scopes []attenuation.Scope
+	seen := make(map[string]bool)
+
+	addScope := func(raw string) {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" || seen[trimmed] {
+			return
+		}
+		s, err := attenuation.ParseScope(trimmed)
+		if err == nil {
+			seen[trimmed] = true
+			scopes = append(scopes, s)
+		}
+	}
+
+	// 1. Standard MCP tool scope: "tool:exec:<name>"
+	addScope(fmt.Sprintf("tool:exec:%s", toolName))
+
+	// 2. Direct scope: "<name>" if it already adheres to domain:action format
+	addScope(toolName)
+
+	// 3. Normalization of common naming patterns:
+	// e.g. "merge_request:approve", "merge_request_approve", "gitlab_merge_request_approve", "git_push"
+	if strings.Contains(toolName, "_") {
+		lastUnderscore := strings.LastIndex(toolName, "_")
+		if lastUnderscore > 0 && lastUnderscore < len(toolName)-1 {
+			domainPart := toolName[:lastUnderscore]
+			actionPart := toolName[lastUnderscore+1:]
+			addScope(fmt.Sprintf("%s:%s", domainPart, actionPart))
+
+			// Check stripping common platform prefixes: "gitlab_", "github_", "mcp_"
+			for _, prefix := range []string{"gitlab_", "github_", "mcp_"} {
+				if strings.HasPrefix(domainPart, prefix) {
+					cleanDomain := strings.TrimPrefix(domainPart, prefix)
+					addScope(fmt.Sprintf("%s:%s", cleanDomain, actionPart))
+				}
+			}
+		}
+	}
+
+	return scopes
+}
+

@@ -114,6 +114,11 @@ func (b *TokenBroker) PublicKey() ed25519.PublicKey {
 	return b.brokerPubKey
 }
 
+// PrivateKey returns the broker's private key for signing.
+func (b *TokenBroker) PrivateKey() ed25519.PrivateKey {
+	return b.brokerPrivKey
+}
+
 // ReplayCache returns the underlying replay cache.
 func (b *TokenBroker) ReplayCache() ReplayCache {
 	return b.replayCache

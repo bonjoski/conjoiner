@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bonjoski/conjoiner/pkg/attenuation"
 	"github.com/bonjoski/conjoiner/pkg/ledger"
 	"github.com/bonjoski/conjoiner/pkg/token"
 )
@@ -624,3 +625,108 @@ func TestGatewayExecutionRevokedTokenRejection(t *testing.T) {
 	}
 	_ = dpopKey2
 }
+
+func TestGatewayWorkflowBoundScopeAttenuation(t *testing.T) {
+	broker, err := token.NewTokenBroker(token.BrokerConfig{})
+	if err != nil {
+		t.Fatalf("failed to create broker: %v", err)
+	}
+
+	dpopKey, _ := token.GenerateDPoPKey()
+	ctx := context.Background()
+
+	// Parent has broad capabilities including git status, git diff, and mr approve
+	_, tokenJWT, err := broker.IssueRootToken(ctx, token.RootTokenRequest{
+		Subject: "agent-reviewer",
+		Scopes: []string{
+			"tool:exec:git:status",
+			"tool:exec:git:diff",
+			"tool:exec:git:push",
+			"git:status",
+			"git:diff",
+			"git:push",
+			"merge_request:read",
+			"merge_request:approve",
+		},
+		TTL:            30 * time.Second,
+		DPoPThumbprint: dpopKey.Thumbprint(),
+	})
+	if err != nil {
+		t.Fatalf("failed to issue token: %v", err)
+	}
+
+	mockExec := &MockToolExecutor{
+		ResultFn: func(ctx context.Context, execCtx ExecutionContext) (*ExecutionResult, error) {
+			return &ExecutionResult{
+				ExitCode: 0,
+				Stdout:   "OK",
+				Duration: time.Millisecond,
+			}, nil
+		},
+	}
+
+	// Code-review manifest: explicitly read-only, forbidden mutations
+	manifest, err := attenuation.NewWorkflowManifest("wf-review", []string{
+		"tool:exec:git:status",
+		"tool:exec:git:diff",
+		"git:status",
+		"git:diff",
+		"merge_request:read",
+	}, []string{
+		"git:push",
+		"repository:push",
+		"merge_request:approve",
+		"merge_request:merge",
+		"ci:trigger",
+	})
+	if err != nil {
+		t.Fatalf("failed creating manifest: %v", err)
+	}
+
+	gw, err := NewGateway(GatewayConfig{
+		BrokerPubKey:     broker.PublicKey(),
+		ReplayCache:      broker.ReplayCache(),
+		Executor:         mockExec,
+		WorkflowManifest: manifest,
+	})
+	if err != nil {
+		t.Fatalf("failed creating gateway: %v", err)
+	}
+
+	// 1. Authorized read operation: git status under manifest -> succeeds
+	proofStatus, _ := dpopKey.CreateProof("EXEC", "tool://git", tokenJWT)
+	resp, err := gw.Execute(ctx, ToolInvocationRequest{
+		Token:     tokenJWT,
+		DPoPProof: proofStatus,
+		ToolName:  "git",
+		Action:    "status",
+	})
+	if err != nil || resp.Result == nil {
+		t.Fatalf("expected git status to succeed under workflow manifest: %v", err)
+	}
+
+	// 2. Forbidden mutation: git push -> fails closed
+	proofPush, _ := dpopKey.CreateProof("EXEC", "tool://git", tokenJWT)
+	_, err = gw.Execute(ctx, ToolInvocationRequest{
+		Token:     tokenJWT,
+		DPoPProof: proofPush,
+		ToolName:  "git",
+		Action:    "push",
+	})
+	if err == nil {
+		t.Fatal("expected git push to be rejected by workflow manifest, got nil")
+	}
+	if !errors.Is(err, attenuation.ErrScopeForbidden) && !errors.Is(err, attenuation.ErrOperationNotPermitted) {
+		t.Fatalf("expected ErrScopeForbidden or ErrOperationNotPermitted, got: %v", err)
+	}
+
+	// Verify CRP rejection proof was created in ledger
+	var rejErr *ledger.RejectionError
+	if !errors.As(err, &rejErr) || rejErr.Proof == nil {
+		t.Fatalf("expected rejection error with cryptographic proof, got: %v", err)
+	}
+	if rejErr.Proof.Verdict != ledger.VerdictDenyScope {
+		t.Errorf("expected VerdictDenyScope in CRP proof, got %v", rejErr.Proof.Verdict)
+	}
+}
+

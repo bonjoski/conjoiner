@@ -143,3 +143,132 @@ func TestCNJ01_NonFilesystemSegmentBoundaryWildcards(t *testing.T) {
 		t.Fatal("CNJ-01 FAILED: tool:exec:git:* escalated to tool:exec:*")
 	}
 }
+
+// TestAdversarial_GitLabScopeEscalationBlocked verifies GitLab-style MCP scope escalation (CVE-2026-123142):
+// An agent executing under a read-only code-review workflow manifest cannot escalate privileges
+// to approve MRs, merge MRs, trigger CI, or push to repositories, even if the parent token possesses broad authority.
+func TestAdversarial_GitLabScopeEscalationBlocked(t *testing.T) {
+	// Attacker has an enterprise parent token with broad root capabilities
+	parentScopes, err := NewScopeSet(
+		"git:read",
+		"git:write",
+		"merge_request:read",
+		"merge_request:approve",
+		"merge_request:merge",
+		"ci:trigger",
+		"repository:push",
+	)
+	if err != nil {
+		t.Fatalf("unexpected parent scope parse error: %v", err)
+	}
+
+	// Code-review workflow manifest: explicitly read-only review, forbidden mutations
+	codeReviewManifest, err := NewWorkflowManifest("wf-code-review-v1", []string{
+		"git:read",
+		"merge_request:read",
+		"merge_request:comment",
+	}, []string{
+		"merge_request:approve",
+		"merge_request:merge",
+		"ci:trigger",
+		"repository:push",
+	})
+	if err != nil {
+		t.Fatalf("failed creating manifest: %v", err)
+	}
+
+	// Calculate effective scope under manifest
+	effective, err := codeReviewManifest.EffectiveScope(parentScopes)
+	if err != nil {
+		t.Fatalf("failed computing effective scope: %v", err)
+	}
+
+	// Test array of high-value state-mutating operations that attacker attempts
+	exploitOperations := []string{
+		"merge_request:approve",
+		"merge_request:merge",
+		"ci:trigger",
+		"repository:push",
+		"mr:approve",
+		"mr:merge",
+		"git:push",
+	}
+
+	for _, exploitOp := range exploitOperations {
+		reqScope, err := ParseScope(exploitOp)
+		if err != nil {
+			t.Fatalf("invalid exploit scope %q: %v", exploitOp, err)
+		}
+
+		// 1. Effective scope must NOT contain the exploit scope
+		if effective.Contains(reqScope) {
+			t.Fatalf("ADVERSARIAL BREACH: effective scope contains forbidden mutation %q", exploitOp)
+		}
+
+		// 2. AuthorizeOperation must reject with ErrOperationNotPermitted or ErrScopeForbidden
+		err = codeReviewManifest.AuthorizeOperation(parentScopes, reqScope)
+		if err == nil {
+			t.Fatalf("ADVERSARIAL BREACH: AuthorizeOperation permitted exploit %q under code-review manifest!", exploitOp)
+		}
+		if !errors.Is(err, ErrOperationNotPermitted) && !errors.Is(err, ErrScopeForbidden) {
+			t.Fatalf("expected ErrOperationNotPermitted or ErrScopeForbidden for %q, got: %v", exploitOp, err)
+		}
+	}
+
+	// Authorized read operations must succeed
+	for _, readOp := range []string{"git:read", "merge_request:read"} {
+		readScope, _ := ParseScope(readOp)
+		if err := codeReviewManifest.AuthorizeOperation(parentScopes, readScope); err != nil {
+			t.Fatalf("expected authorized read %q to succeed, got: %v", readOp, err)
+		}
+	}
+}
+
+// TestAdversarial_MonotonicAttenuationStrictInvariance verifies that workflow scope attenuation
+// is strictly monotonic:
+// 1. Manifest cannot grant permissions the parent token does not have (Privilege Expansion Attack).
+// 2. Manifest PermittedScopes cannot override ForbiddenMutations.
+// 3. Parent broad scopes cannot override ForbiddenMutations.
+func TestAdversarial_MonotonicAttenuationStrictInvariance(t *testing.T) {
+	// Parent token only has read access
+	limitedParent, _ := NewScopeSet("git:read", "issue:read")
+
+	// Rogue manifest claims admin and mutating permissions
+	rogueManifest, err := NewWorkflowManifest("wf-rogue", []string{
+		"git:read",
+		"git:write",
+		"repository:push",
+		"admin:*",
+		"*",
+	}, []string{
+		"repository:push",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	effective, err := rogueManifest.EffectiveScope(limitedParent)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Effective scope MUST strictly be a subset of parent!
+	if !IsSubset(effective, limitedParent) {
+		t.Fatalf("CRITICAL MONOTONICITY VIOLATION: effective scope expanded beyond parent! effective=%v, parent=%v",
+			effective.Strings(), limitedParent.Strings())
+	}
+
+	// None of the rogue permissions can be present
+	for _, ungranted := range []string{"git:write", "repository:push", "admin:*", "*", "admin:all"} {
+		s, _ := ParseScope(ungranted)
+		if effective.Contains(s) {
+			t.Fatalf("CRITICAL: ungranted privilege %q leaked into effective scope!", ungranted)
+		}
+	}
+
+	// Only git:read should be retained (since issue:read was not in manifest permitted)
+	if effective.Len() != 1 || effective.Strings()[0] != "git:read" {
+		t.Fatalf("expected exactly [git:read], got: %v", effective.Strings())
+	}
+}
+

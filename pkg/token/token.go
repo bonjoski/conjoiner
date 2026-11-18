@@ -2,6 +2,7 @@ package token
 
 import (
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
@@ -24,6 +25,8 @@ var (
 	ErrDPoPBindingMismatch = errors.New("dpop key binding mismatch: token is not bound to the presented dpop key")
 	// ErrTokenNotYetValid indicates token issued at is in the future.
 	ErrTokenNotYetValid = errors.New("token is not yet valid")
+	// ErrTokenRevoked indicates the task token, session, or subject has been explicitly revoked.
+	ErrTokenRevoked = errors.New("task token or session has been revoked")
 )
 
 const (
@@ -109,7 +112,14 @@ func (t *TaskToken) Sign(brokerPrivKey ed25519.PrivateKey) (string, error) {
 }
 
 // ParseAndVerifyToken parses and validates a compact JWT token using the Broker's public key.
+// ParseAndVerifyToken parses and validates a compact JWT token using the Broker's public key
+// and validates against the DefaultRevocationStore.
 func ParseAndVerifyToken(tokenJWT string, brokerPubKey ed25519.PublicKey, now time.Time) (*TaskToken, error) {
+	return ParseAndVerifyTokenWithRevocation(tokenJWT, brokerPubKey, now, DefaultRevocationStore)
+}
+
+// ParseAndVerifyTokenWithRevocation parses and validates a compact JWT token with explicit revocation store checks.
+func ParseAndVerifyTokenWithRevocation(tokenJWT string, brokerPubKey ed25519.PublicKey, now time.Time, revStore RevocationStore) (*TaskToken, error) {
 	parts := strings.Split(tokenJWT, ".")
 	if len(parts) != 3 {
 		return nil, ErrMalformedToken
@@ -152,6 +162,11 @@ func ParseAndVerifyToken(tokenJWT string, brokerPubKey ed25519.PublicKey, now ti
 		return nil, fmt.Errorf("%w: invalid payload json: %w", ErrMalformedToken, err)
 	}
 
+	// Verify revocation status
+	if revStore != nil && revStore.IsRevoked(token.JTI, token.SessionID, token.Subject) {
+		return nil, ErrTokenRevoked
+	}
+
 	// Verify expiration
 	if token.IsExpired(now) {
 		return nil, fmt.Errorf("%w: expired at %s, current %s", ErrExpiredToken,
@@ -165,4 +180,70 @@ func ParseAndVerifyToken(tokenJWT string, brokerPubKey ed25519.PublicKey, now ti
 	}
 
 	return &token, nil
+}
+
+// GenerateUUIDv4 produces a cryptographically secure RFC 4122 v4 UUID string.
+func GenerateUUIDv4() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("crypto rand failed: %w", err)
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // Version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // Variant RFC 4122
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
+}
+
+// ComputeJWKThumbprint calculates the RFC 7638 JWK thumbprint for an Ed25519 public key.
+func ComputeJWKThumbprint(pubKey ed25519.PublicKey) string {
+	jwk := JWK{
+		Kty: "OKP",
+		Crv: "Ed25519",
+		X:   base64.RawURLEncoding.EncodeToString(pubKey),
+	}
+	return jwk.Thumbprint()
+}
+
+// MintWorkloadIdentity mints an ephemeral TaskToken with subject spiffe://bonjo.dev/agent/<session_id>,
+// DPoP binding to pubKey, unique UUID JTI, strictly enforced 30s TTL (DefaultTTL), and depth 0.
+func MintWorkloadIdentity(sessionID string, pubKey ed25519.PublicKey, scopes []string, privKey ed25519.PrivateKey) (*TaskToken, string, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil, "", errors.New("sessionID cannot be empty")
+	}
+	if len(pubKey) != ed25519.PublicKeySize {
+		return nil, "", errors.New("invalid public key size: expected ed25519.PublicKeySize")
+	}
+	if len(privKey) != ed25519.PrivateKeySize {
+		return nil, "", errors.New("invalid private key size: expected ed25519.PrivateKeySize")
+	}
+
+	jti, err := GenerateUUIDv4()
+	if err != nil {
+		return nil, "", fmt.Errorf("failed generating UUID JTI: %w", err)
+	}
+
+	jkt := ComputeJWKThumbprint(pubKey)
+	now := time.Now().UTC()
+
+	tok := &TaskToken{
+		JTI:       jti,
+		Issuer:    DefaultIssuer,
+		Subject:   fmt.Sprintf("spiffe://bonjo.dev/agent/%s", sessionID),
+		SessionID: sessionID,
+		Audience:  DefaultAudience,
+		IssuedAt:  now.Unix(),
+		ExpiresAt: now.Add(DefaultTTL).Unix(),
+		Scope:     scopes,
+		CNF: CNF{
+			JKT: jkt,
+		},
+		Depth: 0,
+	}
+
+	signedJWT, err := tok.Sign(privKey)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed signing workload identity token: %w", err)
+	}
+
+	return tok, signedJWT, nil
 }

@@ -5,10 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/bonjoski/conjoiner/pkg/attenuation"
 	"github.com/bonjoski/conjoiner/pkg/token"
 )
 
@@ -304,3 +308,251 @@ func TestCNJ08_VariationSelectorsBidiAndFormatRunesStripped(t *testing.T) {
 		t.Fatalf("unexpected detection reason: %s", reason)
 	}
 }
+
+// TestAdversarial_GrokUnpromptedBackgroundCheckinsFailClosed models the xAI Grok Bot attack vector:
+// Enterprise bots making 31 unprompted background check-in calls to Google Calendar, Slack,
+// Gmail, GitHub, and Notion while user laptops were closed and screens were locked.
+// Every call must fail closed immediately with JSON-RPC error code -32001 and be forensically logged.
+func TestAdversarial_GrokUnpromptedBackgroundCheckinsFailClosed(t *testing.T) {
+	tmpDir := t.TempDir()
+	auditLogPath := filepath.Join(tmpDir, "audit.log")
+
+	// Target commands and corporate SaaS tools that Grok bots attempted to access in background
+	grokTools := []string{
+		"google_calendar_list_events",
+		"google_calendar_get_event",
+		"slack_get_channel_history",
+		"slack_list_channels",
+		"slack_read_dms",
+		"gmail_list_messages",
+		"gmail_get_thread",
+		"github_list_pull_requests",
+		"github_get_issue",
+		"notion_query_database",
+		"notion_get_page",
+	}
+
+	var allowedScopes []string
+	for _, tool := range grokTools {
+		allowedScopes = append(allowedScopes, "tool:exec:"+tool)
+	}
+
+	cfg := Config{
+		TargetCommand:           "/bin/cat",
+		AllowedScopes:           allowedScopes,
+		RequireHardwarePresence: true,
+		AuditLogPath:            auditLogPath,
+		SessionID:               "grok-enterprise-bot-01",
+	}
+
+	shim, err := NewTransportShim(cfg)
+	if err != nil {
+		t.Fatalf("failed initializing MCP shim: %v", err)
+	}
+
+	// Workstation state: Laptop lid is closed and screen is locked (overnight background check-in)
+	t.Setenv("MOCK_LOCK_STATE", "locked")
+
+	// Simulate 31 unprompted unattended background requests
+	totalRequests := 31
+	for i := 1; i <= totalRequests; i++ {
+		toolName := grokTools[i%len(grokTools)]
+		callMsg := fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"%s","arguments":{"limit":50}}}`, i, toolName)
+
+		var serverIn, clientOut bytes.Buffer
+		forwarded := shim.handleInboundLine([]byte(callMsg), &serverIn, &clientOut)
+		if forwarded {
+			t.Fatalf("CRITICAL SECURITY FAILURE: unprompted background tool call #%d (%s) was forwarded to server while workstation locked!", i, toolName)
+		}
+
+		var resp JSONRPCMessage
+		if err := json.Unmarshal(clientOut.Bytes(), &resp); err != nil {
+			t.Fatalf("failed parsing error response for call #%d: %v", i, err)
+		}
+
+		if resp.Error == nil {
+			t.Fatalf("call #%d: expected JSON-RPC error, got nil", i)
+		}
+		if resp.Error.Code != -32001 {
+			t.Fatalf("call #%d: expected error code -32001, got %d", i, resp.Error.Code)
+		}
+		if resp.Error.Message != "Zero-Background-Authority: User presence failed / locked" {
+			t.Fatalf("call #%d: expected error message 'Zero-Background-Authority: User presence failed / locked', got %q", i, resp.Error.Message)
+		}
+	}
+
+	// Verify all 31 blocked attempts were recorded in audit log
+	auditData, err := os.ReadFile(auditLogPath)
+	if err != nil {
+		t.Fatalf("failed reading audit log: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(auditData)), "\n")
+	if len(lines) != totalRequests {
+		t.Fatalf("expected %d audit log lines, got %d", totalRequests, len(lines))
+	}
+
+	// Verify authorized presence: once user unlocks workstation, tool calls are permitted
+	t.Setenv("MOCK_LOCK_STATE", "unlocked")
+	validMsg := `{"jsonrpc":"2.0","id":100,"method":"tools/call","params":{"name":"slack_get_channel_history","arguments":{}}}`
+	var serverIn, clientOut bytes.Buffer
+	if !shim.handleInboundLine([]byte(validMsg), &serverIn, &clientOut) {
+		t.Fatalf("expected user-prompted tool call with verified presence to succeed: %s", clientOut.String())
+	}
+}
+
+// TestAdversarial_GitLabMCPWorkflowScopeEscalationBlocked verifies that an MCP client
+// bounded by a code-review workflow manifest cannot execute state-mutating operations
+// (CVE-2026-123142: MCP OAuth scope escalation allowing unauthorized MR approval/merge).
+func TestAdversarial_GitLabMCPWorkflowScopeEscalationBlocked(t *testing.T) {
+	manifest, err := attenuation.NewWorkflowManifest("wf-gitlab-review", []string{
+		"git:read",
+		"merge_request:read",
+		"tool:exec:git_read",
+		"tool:exec:merge_request_read",
+	}, []string{
+		"merge_request:approve",
+		"merge_request:merge",
+		"ci:trigger",
+		"repository:push",
+	})
+	if err != nil {
+		t.Fatalf("failed creating manifest: %v", err)
+	}
+
+	// Parent has broad capabilities
+	cfg := Config{
+		TargetCommand: "/bin/cat",
+		AllowedScopes: []string{
+			"git:read",
+			"git:write",
+			"merge_request:read",
+			"merge_request:approve",
+			"merge_request:merge",
+			"repository:push",
+			"tool:exec:git_read",
+			"tool:exec:merge_request_read",
+			"tool:exec:merge_request_approve",
+			"tool:exec:gitlab_merge_request_approve",
+		},
+		WorkflowManifest: manifest,
+	}
+
+	shim, err := NewTransportShim(cfg)
+	if err != nil {
+		t.Fatalf("failed initializing shim with workflow manifest: %v", err)
+	}
+
+	// Exploits: attempting MR approvals, merges, and pushes under code-review manifest
+	unauthorizedCalls := []string{
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"merge_request:approve","arguments":{"mr_id":42}}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"merge_request_approve","arguments":{"mr_id":42}}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"gitlab_merge_request_approve","arguments":{"mr_id":42}}}`,
+		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"merge_request:merge","arguments":{"mr_id":42}}}`,
+		`{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"repository_push","arguments":{}}}`,
+	}
+
+	for _, call := range unauthorizedCalls {
+		var serverIn, clientOut bytes.Buffer
+		forwarded := shim.handleInboundLine([]byte(call), &serverIn, &clientOut)
+		if forwarded {
+			t.Fatalf("CVE-2026-123142 REGRESSION: unauthorized mutation forwarded: %s", call)
+		}
+
+		var resp JSONRPCMessage
+		if err := json.Unmarshal(clientOut.Bytes(), &resp); err != nil {
+			t.Fatalf("failed unmarshaling error: %v", err)
+		}
+		if resp.Error == nil || resp.Error.Code != ErrCodeScopeDenied {
+			t.Fatalf("expected ErrCodeScopeDenied (-32002), got: %+v", resp.Error)
+		}
+		if !strings.Contains(resp.Error.Message, "not permitted by workflow manifest") &&
+			!strings.Contains(resp.Error.Message, "Monotonic scope attenuation denied") {
+			t.Fatalf("expected manifest denial message, got: %s", resp.Error.Message)
+		}
+	}
+
+	// Legitimate read operations must succeed
+	legitimateCalls := []string{
+		`{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"merge_request:read","arguments":{"mr_id":42}}}`,
+		`{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"git_read","arguments":{}}}`,
+	}
+
+	for _, call := range legitimateCalls {
+		var serverIn, clientOut bytes.Buffer
+		forwarded := shim.handleInboundLine([]byte(call), &serverIn, &clientOut)
+		if !forwarded {
+			t.Fatalf("expected legitimate read operation to be permitted: %s, err: %s", call, clientOut.String())
+		}
+	}
+}
+
+// TestAdversarial_FindingSanitizerScrubsSecretsBeforeLLMContext_GitLabCVE2026115736 verifies that
+// security scanner findings containing raw vendor secrets (GitLab glpat-, GitHub ghp_, Slack xoxb-,
+// and SSH/PEM private keys) are scrubbed before entering the LLM context (countering GitLab CVE-2026-115736).
+func TestAdversarial_FindingSanitizerScrubsSecretsBeforeLLMContext_GitLabCVE2026115736(t *testing.T) {
+	sanitizer := NewSanitizer()
+
+	rawSecrets := []string{
+		"glpat-1234567890abcdefghij",
+		"ghp_1234567890abcdefghijklmnopqrstuvwxyzABCD",
+		"xoxb-mock-token-sample-123456",
+		"-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAA=\n-----END OPENSSH PRIVATE KEY-----",
+		"AKIAIOSFODNN7EXAMPLE",
+	}
+
+	findingPayload := fmt.Sprintf(`{
+		"jsonrpc": "2.0",
+		"id": 1,
+		"result": {
+			"content": [
+				{
+					"type": "text",
+					"text": "GitLab Secret Detection Finding in repo:\nGitLab Token: %s\nGitHub Token: %s\nSlack Token: %s\nSSH Key:\n%s\nAWS Key: %s"
+				}
+			]
+		}
+	}`, rawSecrets[0], rawSecrets[1], rawSecrets[2], rawSecrets[3], rawSecrets[4])
+
+	// 1. Verify direct Sanitizer.ScrubSecrets behavior
+	scrubbedBytes, modified := sanitizer.ScrubSecrets([]byte(findingPayload))
+	if !modified {
+		t.Fatalf("CVE-2026-115736: expected Sanitizer.ScrubSecrets to detect and modify secret findings")
+	}
+
+	scrubbedStr := string(scrubbedBytes)
+	for _, raw := range rawSecrets {
+		if strings.Contains(scrubbedStr, raw) {
+			t.Fatalf("CVE-2026-115736 REGRESSION: raw secret %q leaked in sanitized output: %s", raw, scrubbedStr)
+		}
+	}
+
+	if !strings.Contains(scrubbedStr, "[REDACTED_SECRET]") {
+		t.Fatalf("expected [REDACTED_SECRET] placeholder in sanitized output, got: %s", scrubbedStr)
+	}
+
+	// 2. Verify TransportShim outbound line pipeline integration
+	cfg := Config{
+		TargetCommand: "/bin/cat",
+		AllowedScopes: []string{"tool:exec:security_scan"},
+		ScrubSecrets:  true,
+	}
+	shim, err := NewTransportShim(cfg)
+	if err != nil {
+		t.Fatalf("failed initializing shim: %v", err)
+	}
+
+	outbound := shim.handleOutboundLine([]byte(findingPayload))
+	outboundStr := string(outbound)
+
+	for _, raw := range rawSecrets {
+		if strings.Contains(outboundStr, raw) {
+			t.Fatalf("CVE-2026-115736 REGRESSION: raw secret %q leaked through MCP outbound line: %s", raw, outboundStr)
+		}
+	}
+
+	if !strings.Contains(outboundStr, "[REDACTED_SECRET]") {
+		t.Fatalf("expected [REDACTED_SECRET] in MCP shim outbound line, got: %s", outboundStr)
+	}
+}
+

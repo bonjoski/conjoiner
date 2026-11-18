@@ -74,7 +74,25 @@ func getOrGenerateBrokerKeys() (*RootKeyStorage, error) {
 	return &RootKeyStorage{PrivateKey: priv, PublicKey: pub}, nil
 }
 
+func getRevocationsFilePath() string {
+	if p := os.Getenv("CONJOINER_REVOCATIONS_FILE"); p != "" {
+		return p
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".conjoiner", "revocations.json")
+	}
+	return ""
+}
+
+func initRevocations() {
+	if path := getRevocationsFilePath(); path != "" {
+		_ = token.LoadRevocationsFromFile(token.DefaultRevocationStore, path)
+	}
+}
+
 func main() {
+	initRevocations()
+
 	exeName := filepath.Base(os.Args[0])
 	if exeName == "mcp-conjoiner-proxy" {
 		handleMCPShimCommand(os.Args[1:])
@@ -119,23 +137,38 @@ func printUsage() {
 
 Usage:
   conjoiner <command> [subcommand] [flags]
-  mcp-conjoiner-proxy [--scope <scopes>] -- <target-command> [args...]
+  mcp-conjoiner-proxy [--require-hardware-presence] [--workflow-manifest <path>] [--audit-log <path>] [--scrub-secrets] -- <target-command> [args...]
 
 Commands:
   run       Run a command deterministically through the policy gate (alias for gate exec)
-  token     Manage, issue, attenuate, and verify task tokens
+  token     Manage, issue, attenuate, verify, and revoke task tokens
+              issue     --scope <scopes> [--ttl <duration>] [--sub <agent-id>]
+              attenuate --parent <jwt> --requested-scope <scopes> [--ttl <duration>]
+              verify    --token <jwt>
+              revoke    --jti <id> [--reason <reason>] [--ttl <duration>]
   dpop      Manage ephemeral DPoP keypairs and proofs
+              keygen    Generate an ephemeral Ed25519 DPoP keypair
   gate      Deterministic policy gateway execution
+              exec      --token <jwt> --dpop <proof> --tool <tool> --action <action> [--workflow-manifest <path>] [-- <args...>]
   mandate   Compile natural language security mandates into capability scopes
+              compile   [--ai] [--ceiling <scopes>] [--json] <instruction>
   mcp       MCP security tools: audit manifests for SSRF/poisoned upstreams
+              audit     --manifest <path> [--purge] [--dry-run] [--json]
+              shim      Transparent MCP transport shim & DPoP tool gateway
   mcp-shim  Transparent MCP transport shim & DPoP tool gateway
+              --require-hardware-presence  Enforce zero-background-authority hardware presence gate
+              --workflow-manifest <path>   Path to workflow manifest JSON for scope attenuation
+              --audit-log <path>           Path to append-only forensic audit log file
+              --scrub-secrets              Enable Shield secret finding scrubbing on outbound tool output (default: true)
+              --token <jwt>                Signed Conjoiner TaskToken JWT
+              --scope <scopes>             Comma-separated allowed scopes
   version   Display Conjoiner version`)
 }
 
 // Token CLI subcommands
 func handleTokenCommand(args []string) {
 	if len(args) < 1 {
-		fmt.Println(`Usage: conjoiner token <issue|attenuate|verify> [flags]`)
+		fmt.Println(`Usage: conjoiner token <issue|attenuate|verify|revoke> [flags]`)
 		os.Exit(1)
 	}
 
@@ -342,6 +375,45 @@ func handleTokenCommand(args []string) {
 		fmt.Println("Token is VALID:")
 		fmt.Println(string(enc))
 
+	case "revoke":
+		revokeCmd := flag.NewFlagSet("token revoke", flag.ExitOnError)
+		jtiFlag := revokeCmd.String("jti", "", "JTI of the token to revoke")
+		reasonFlag := revokeCmd.String("reason", "manual CLI revocation", "Reason for token revocation")
+		ttlFlag := revokeCmd.Duration("ttl", 24*time.Hour, "Revocation retention window (default: 24h)")
+
+		if err := revokeCmd.Parse(args[1:]); err != nil {
+			os.Exit(1)
+		}
+
+		if strings.TrimSpace(*jtiFlag) == "" {
+			fmt.Fprintln(os.Stderr, "Usage: conjoiner token revoke --jti <id> [--reason <reason>] [--ttl <duration>]")
+			fmt.Fprintln(os.Stderr, "Error: --jti is required")
+			os.Exit(1)
+		}
+
+		jti := strings.TrimSpace(*jtiFlag)
+		expiresAt := time.Now().UTC().Add(*ttlFlag)
+
+		if err := token.DefaultRevocationStore.RevokeWithReason(jti, expiresAt, *reasonFlag); err != nil {
+			fmt.Fprintf(os.Stderr, "Error revoking token in memory: %v\n", err)
+			os.Exit(1)
+		}
+
+		if path := getRevocationsFilePath(); path != "" {
+			if err := token.PersistRevocationToFile(path, "jti:"+jti, expiresAt, *reasonFlag); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed persisting revocation to disk: %v\n", err)
+			}
+		}
+
+		output := map[string]any{
+			"status":     "revoked",
+			"jti":        jti,
+			"reason":     *reasonFlag,
+			"expires_at": expiresAt.Format(time.RFC3339),
+		}
+		enc, _ := json.MarshalIndent(output, "", "  ")
+		fmt.Println(string(enc))
+
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown token subcommand: %s\n", args[0])
 		os.Exit(1)
@@ -389,6 +461,7 @@ func handleGateCommand(args []string) {
 		toolFlag := execCmd.String("tool", "", "Tool name (e.g. echo, git)")
 		actionFlag := execCmd.String("action", "", "Tool action (e.g. print, status)")
 		resFlag := execCmd.String("resource", "", "Target resource")
+		manifestFlag := execCmd.String("workflow-manifest", "", "Path to workflow manifest JSON for scope attenuation")
 
 		if err := execCmd.Parse(args[1:]); err != nil {
 			os.Exit(1)
@@ -397,6 +470,7 @@ func handleGateCommand(args []string) {
 		remainingArgs := execCmd.Args()
 
 		if *tokFlag == "" || *toolFlag == "" || *actionFlag == "" {
+			fmt.Fprintln(os.Stderr, "Usage: conjoiner gate exec --token <jwt> --dpop <proof> --tool <tool> --action <action> [--workflow-manifest <path>] [-- <args...>]")
 			fmt.Fprintln(os.Stderr, "Error: --token, --tool, and --action are required")
 			os.Exit(1)
 		}
@@ -407,14 +481,26 @@ func handleGateCommand(args []string) {
 			os.Exit(1)
 		}
 
+		var workflowManifest *attenuation.WorkflowManifest
+		if *manifestFlag != "" {
+			var mErr error
+			workflowManifest, mErr = attenuation.LoadWorkflowManifest(*manifestFlag)
+			if mErr != nil {
+				fmt.Fprintf(os.Stderr, "Error loading workflow manifest: %v\n", mErr)
+				os.Exit(1)
+			}
+		}
+
 		safeExec := gateway.NewSafeLocalExecutor(map[string]string{
 			"echo": "/bin/echo",
 			"git":  "/usr/bin/git",
 		}, 10*time.Second)
 
 		gw, err := gateway.NewGateway(gateway.GatewayConfig{
-			BrokerPubKey: keys.PublicKey,
-			Executor:     safeExec,
+			BrokerPubKey:     keys.PublicKey,
+			Executor:         safeExec,
+			RevocationStore:  token.DefaultRevocationStore,
+			WorkflowManifest: workflowManifest,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error initializing gateway: %v\n", err)
@@ -423,12 +509,13 @@ func handleGateCommand(args []string) {
 
 		ctx := context.Background()
 		resp, err := gw.Execute(ctx, gateway.ToolInvocationRequest{
-			Token:     *tokFlag,
-			DPoPProof: *dpopFlag,
-			ToolName:  *toolFlag,
-			Action:    *actionFlag,
-			Resource:  *resFlag,
-			Arguments: remainingArgs,
+			Token:            *tokFlag,
+			DPoPProof:        *dpopFlag,
+			ToolName:         *toolFlag,
+			Action:           *actionFlag,
+			Resource:         *resFlag,
+			Arguments:        remainingArgs,
+			WorkflowManifest: workflowManifest,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Gateway Rejection: %v\n", err)
@@ -528,6 +615,13 @@ func handleMCPShimCommand(args []string) {
 	scopeFlag := shimCmd.String("scope", "", "Comma-separated allowed scopes (or set CONJOINER_SCOPES)")
 	tokenFlag := shimCmd.String("token", "", "Signed Conjoiner TaskToken JWT (or set CONJOINER_TOKEN)")
 	noRedactFlag := shimCmd.Bool("no-redact", false, "Disable Shield secret output redaction")
+	scrubSecretsFlag := shimCmd.Bool("scrub-secrets", true, "Enable Shield secret finding scrubbing on outbound tool output (default: true)")
+	requirePresenceFlag := shimCmd.Bool("require-hardware-presence", false, "Enforce zero-background-authority hardware presence gate")
+	manifestFlag := shimCmd.String("workflow-manifest", "", "Path to workflow manifest JSON for scope attenuation")
+	enforceManifestFlag := shimCmd.Bool("enforce-workflow-manifest", false, "Fail closed if workflow manifest is missing")
+	auditLogFlag := shimCmd.String("audit-log", "", "Path to append-only audit log file")
+	targetCmdFlag := shimCmd.String("target-command", "", "Target command to execute (alternative to -- <command>)")
+	_ = shimCmd.Bool("stdin", false, "Read JSON-RPC from standard input")
 
 	// Find "--" delimiter separating flags from target command
 	var targetArgs []string
@@ -547,14 +641,25 @@ func handleMCPShimCommand(args []string) {
 		os.Exit(1)
 	}
 
-	// If targetArgs was not separated by "--", check remaining positional args
+	// If targetArgs was not separated by "--", check remaining positional args or --target-command
 	if len(targetArgs) == 0 {
-		targetArgs = shimCmd.Args()
+		if strings.TrimSpace(*targetCmdFlag) != "" {
+			targetArgs = strings.Fields(strings.TrimSpace(*targetCmdFlag))
+		} else {
+			targetArgs = shimCmd.Args()
+		}
 	}
 
 	if len(targetArgs) == 0 {
-		fmt.Fprintln(os.Stderr, "Usage: conjoiner mcp-shim [--scope <scopes> | --token <jwt>] -- <target-command> [args...]")
-		fmt.Fprintln(os.Stderr, "   or: mcp-conjoiner-proxy [--scope <scopes> | --token <jwt>] -- <target-command> [args...]")
+		fmt.Fprintln(os.Stderr, "Usage: conjoiner mcp-shim [flags] -- <target-command> [args...]")
+		fmt.Fprintln(os.Stderr, "   or: mcp-conjoiner-proxy [--require-hardware-presence] [--workflow-manifest <path>] [--audit-log <path>] [--scrub-secrets] -- <target-command> [args...]")
+		fmt.Fprintln(os.Stderr, "\nFlags:")
+		fmt.Fprintln(os.Stderr, "  --require-hardware-presence  Enforce zero-background-authority hardware presence gate")
+		fmt.Fprintln(os.Stderr, "  --workflow-manifest <path>   Path to workflow manifest JSON for scope attenuation")
+		fmt.Fprintln(os.Stderr, "  --audit-log <path>           Path to append-only forensic audit log file")
+		fmt.Fprintln(os.Stderr, "  --scrub-secrets              Enable Shield secret finding scrubbing on outbound tool output (default: true)")
+		fmt.Fprintln(os.Stderr, "  --token <jwt>                Signed Conjoiner TaskToken JWT")
+		fmt.Fprintln(os.Stderr, "  --scope <scopes>             Comma-separated allowed scopes")
 		os.Exit(1)
 	}
 
@@ -571,12 +676,17 @@ func handleMCPShimCommand(args []string) {
 	}
 
 	cfg := mcp.Config{
-		TargetCommand: targetArgs[0],
-		TargetArgs:    targetArgs[1:],
-		AllowedScopes: allowedScopes,
-		Token:         *tokenFlag,
-		BrokerPubKey:  brokerPubKey,
-		ScrubSecrets:  !*noRedactFlag,
+		TargetCommand:           targetArgs[0],
+		TargetArgs:              targetArgs[1:],
+		AllowedScopes:           allowedScopes,
+		Token:                   *tokenFlag,
+		BrokerPubKey:            brokerPubKey,
+		ScrubSecrets:            *scrubSecretsFlag && !*noRedactFlag,
+		RequireHardwarePresence: *requirePresenceFlag,
+		WorkflowManifestPath:    *manifestFlag,
+		EnforceWorkflowManifest: *enforceManifestFlag,
+		AuditLogPath:            *auditLogFlag,
+		RevocationStore:         token.DefaultRevocationStore,
 	}
 
 	shim, err := mcp.NewTransportShim(cfg)
