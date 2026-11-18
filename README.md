@@ -81,6 +81,32 @@ conjoiner token attenuate --parent "$TOKEN_JSON" --requested-scope "fs:write:/et
 # Error: requested scope violates attenuation invariant (not a strict subset): superset permission expansion denied
 ```
 
+### 4. Sovereign AgentPass (Accountable Human-Supervised Agent Sessions)
+
+Conjoiner provides an open-standard, zero-standing-privilege counterweight to proprietary commercial platforms (e.g. HYPR AgentPass), delivering local developer workstation governance without cloud lock-in or mobile push latency:
+
+```bash
+# 1. Issue an AgentPass tied to a named human supervisor and initial scope
+PASS_JSON=$(conjoiner agentpass issue \
+  --supervisor "developer@bonjo.dev" \
+  --agent "agent:cursor:main" \
+  --scope "repo:read,git:status,git:commit" \
+  --ttl 1h \
+  --json)
+
+# 2. Attenuate pass for a child subagent (enforces ChildScope = ParentScope ∩ RequestedScope)
+CHILD_PASS=$(conjoiner agentpass attenuate \
+  --parent "$PASS_JSON" \
+  --child-agent "agent:cursor:sub-01" \
+  --requested-scope "repo:read,git:commit" \
+  --json)
+
+# 3. Mint short-lived, single-use 30s tool execution token on demand
+conjoiner agentpass mint-token \
+  --pass "$CHILD_PASS" \
+  --action "git:commit"
+```
+
 ---
 
 ## SLSA Provenance & Verification

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bonjoski/conjoiner/pkg/agentpass"
 	"github.com/bonjoski/conjoiner/pkg/attenuation"
 	"github.com/bonjoski/conjoiner/pkg/gateway"
 	"github.com/bonjoski/conjoiner/pkg/mandate"
@@ -107,6 +108,8 @@ func main() {
 	switch os.Args[1] {
 	case "token":
 		handleTokenCommand(os.Args[2:])
+	case "agentpass", "pass":
+		handleAgentPassCommand(os.Args[2:])
 	case "dpop":
 		handleDPoPCommand(os.Args[2:])
 	case "gate":
@@ -141,6 +144,11 @@ Usage:
 
 Commands:
   run       Run a command deterministically through the policy gate (alias for gate exec)
+  agentpass Manage accountable, human-supervised AgentPass sessions & attenuated delegation
+              issue       --scope <scopes> [--supervisor <name>] [--ttl <duration>]
+              attenuate   --parent <jwt> --requested-scope <scopes> [--ttl <duration>]
+              verify      --pass <jwt>
+              mint-token  --pass <jwt> --action <tool:action>
   token     Manage, issue, attenuate, verify, and revoke task tokens
               issue     --scope <scopes> [--ttl <duration>] [--sub <agent-id>]
               attenuate --parent <jwt> --requested-scope <scopes> [--ttl <duration>]
@@ -776,6 +784,269 @@ func handleMCPCommand(args []string) {
 		handleMCPShimCommand(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown mcp subcommand: %s\n", args[0])
+		os.Exit(1)
+	}
+}
+
+func extractTokenString(input, key string) string {
+	trimmed := strings.TrimSpace(input)
+	if strings.HasPrefix(trimmed, "{") {
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(trimmed), &parsed); err == nil {
+			if tok, ok := parsed[key].(string); ok {
+				return tok
+			}
+			if tok, ok := parsed["access_token"].(string); ok {
+				return tok
+			}
+		}
+	}
+	return trimmed
+}
+
+func handleAgentPassCommand(args []string) {
+	if len(args) < 1 {
+		fmt.Println(`Usage: conjoiner agentpass <issue|attenuate|verify|mint-token> [flags]`)
+		os.Exit(1)
+	}
+
+	keys, err := getOrGenerateBrokerKeys()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error acquiring broker keys: %v\n", err)
+		os.Exit(1)
+	}
+
+	now := time.Now()
+
+	switch args[0] {
+	case "issue":
+		issueCmd := flag.NewFlagSet("agentpass issue", flag.ExitOnError)
+		supFlag := issueCmd.String("supervisor", "", "Accountable human supervisor (e.g. user@org.dev or $USER)")
+		agentFlag := issueCmd.String("agent", "", "Agent identifier (default: generated)")
+		scopeFlag := issueCmd.String("scope", "", "Granted scope capabilities (comma-separated)")
+		ttlFlag := issueCmd.Duration("ttl", 1*time.Hour, "AgentPass lifetime (default: 1h)")
+		tokenTTLFlag := issueCmd.Duration("token-ttl", 30*time.Second, "Minted tool token TTL (default: 30s)")
+		worktreeFlag := issueCmd.String("worktree", "", "Bound workspace worktree directory")
+		dpopFlag := issueCmd.String("dpop-thumbprint", "", "Bound RFC 7638 DPoP key thumbprint (generated if empty)")
+		hardwareFlag := issueCmd.Bool("require-hardware", false, "Require Locksmith hardware/biometric presence")
+		jsonFlag := issueCmd.Bool("json", false, "Output full JSON envelope including dpop_key")
+
+		_ = issueCmd.Parse(args[1:])
+
+		supervisor := *supFlag
+		if supervisor == "" {
+			supervisor = os.Getenv("USER")
+			if supervisor == "" {
+				supervisor = "local-developer"
+			}
+		}
+
+		if *scopeFlag == "" {
+			fmt.Fprintln(os.Stderr, "Error: --scope is required")
+			os.Exit(1)
+		}
+
+		dpopThumb := *dpopFlag
+		var dpopKey *token.DPoPKey
+		if dpopThumb == "" {
+			dpopKey, err = token.GenerateDPoPKey()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error generating DPoP key: %v\n", err)
+				os.Exit(1)
+			}
+			dpopThumb = dpopKey.Thumbprint()
+		}
+
+		opts := agentpass.IssueOptions{
+			AgentID:         *agentFlag,
+			HumanSupervisor: supervisor,
+			Scope:           splitScopes(*scopeFlag),
+			WorktreePath:    *worktreeFlag,
+			DPoPThumbprint:  dpopThumb,
+			RequireHardware: *hardwareFlag,
+			Lifetime:        *ttlFlag,
+			TokenTTL:        *tokenTTLFlag,
+		}
+
+		pass, signed, err := agentpass.IssueRootPass(opts, keys.PrivateKey, now)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error issuing AgentPass: %v\n", err)
+			os.Exit(1)
+		}
+
+		if *jsonFlag || dpopKey != nil {
+			output := map[string]any{
+				"agentpass_token": signed,
+				"pass_id":         pass.PassID,
+				"agent_id":        pass.AgentID,
+				"supervisor":      pass.HumanSupervisor,
+				"scope":           pass.Scope,
+				"expires_at":      pass.ExpiresAt,
+				"expires_in":      pass.ExpiresAt - now.Unix(),
+				"dpop_jkt":        pass.DPoPThumbprint,
+			}
+			if dpopKey != nil {
+				output["dpop_key"] = map[string]string{
+					"thumbprint": dpopKey.Thumbprint(),
+					"jwk_x":      dpopKey.JWK().X,
+					"priv":       base64.RawURLEncoding.EncodeToString(dpopKey.PrivateKey),
+				}
+			}
+			enc, _ := json.MarshalIndent(output, "", "  ")
+			fmt.Println(string(enc))
+		} else {
+			fmt.Println(signed)
+		}
+
+	case "attenuate":
+		attenuateCmd := flag.NewFlagSet("agentpass attenuate", flag.ExitOnError)
+		parentFlag := attenuateCmd.String("parent", "", "Parent AgentPass JWT or JSON containing agentpass_token")
+		reqScopeFlag := attenuateCmd.String("requested-scope", "", "Attenuated subset scopes (comma-separated)")
+		childAgentFlag := attenuateCmd.String("child-agent", "", "Child subagent ID (default: generated)")
+		dpopFlag := attenuateCmd.String("dpop-thumbprint", "", "Child DPoP thumbprint")
+		ttlFlag := attenuateCmd.Duration("ttl", 30*time.Minute, "Child pass lifetime")
+		jsonFlag := attenuateCmd.Bool("json", false, "Output detailed JSON metadata")
+
+		_ = attenuateCmd.Parse(args[1:])
+
+		if *parentFlag == "" || *reqScopeFlag == "" {
+			fmt.Fprintln(os.Stderr, "Error: --parent and --requested-scope are required")
+			os.Exit(1)
+		}
+
+		parentJWT := extractTokenString(*parentFlag, "agentpass_token")
+		parentPass, err := agentpass.Verify(parentJWT, keys.PublicKey, now)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error verifying parent AgentPass: %v\n", err)
+			os.Exit(1)
+		}
+
+		dpopThumb := *dpopFlag
+		var dpopKey *token.DPoPKey
+		if dpopThumb == "" {
+			dpopKey, err = token.GenerateDPoPKey()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error generating child DPoP key: %v\n", err)
+				os.Exit(1)
+			}
+			dpopThumb = dpopKey.Thumbprint()
+		}
+
+		childOpts := agentpass.AttenuateOptions{
+			RequestedScope: splitScopes(*reqScopeFlag),
+			ChildAgentID:   *childAgentFlag,
+			ChildDPoPThumb: dpopThumb,
+			Lifetime:       *ttlFlag,
+		}
+
+		childPass, childSigned, err := agentpass.AttenuatePass(parentPass, childOpts, keys.PrivateKey, now)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error attenuating AgentPass: %v\n", err)
+			os.Exit(1)
+		}
+
+		if *jsonFlag || dpopKey != nil {
+			output := map[string]any{
+				"agentpass_token":  childSigned,
+				"pass_id":          childPass.PassID,
+				"parent_pass_id":   childPass.ParentPassID,
+				"delegation_depth": childPass.DelegationDepth,
+				"agent_id":         childPass.AgentID,
+				"supervisor":       childPass.HumanSupervisor,
+				"scope":            childPass.Scope,
+				"expires_at":       childPass.ExpiresAt,
+				"dpop_jkt":         childPass.DPoPThumbprint,
+			}
+			if dpopKey != nil {
+				output["dpop_key"] = map[string]string{
+					"thumbprint": dpopKey.Thumbprint(),
+					"jwk_x":      dpopKey.JWK().X,
+					"priv":       base64.RawURLEncoding.EncodeToString(dpopKey.PrivateKey),
+				}
+			}
+			enc, _ := json.MarshalIndent(output, "", "  ")
+			fmt.Println(string(enc))
+		} else {
+			fmt.Println(childSigned)
+		}
+
+	case "verify":
+		verifyCmd := flag.NewFlagSet("agentpass verify", flag.ExitOnError)
+		passFlag := verifyCmd.String("pass", "", "AgentPass JWT string or JSON")
+		_ = verifyCmd.Parse(args[1:])
+
+		if *passFlag == "" {
+			fmt.Fprintln(os.Stderr, "Error: --pass is required")
+			os.Exit(1)
+		}
+
+		passJWT := extractTokenString(*passFlag, "agentpass_token")
+		pass, err := agentpass.Verify(passJWT, keys.PublicKey, now)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Verification failed: %v\n", err)
+			os.Exit(1)
+		}
+
+		enc, _ := json.MarshalIndent(pass, "", "  ")
+		fmt.Println(string(enc))
+
+	case "mint-token":
+		mintCmd := flag.NewFlagSet("agentpass mint-token", flag.ExitOnError)
+		passFlag := mintCmd.String("pass", "", "AgentPass JWT string or JSON")
+		actionFlag := mintCmd.String("action", "", "Tool action scope (e.g. 'git:commit', 'tool:exec:cat')")
+		_ = mintCmd.Parse(args[1:])
+
+		if *passFlag == "" || *actionFlag == "" {
+			fmt.Fprintln(os.Stderr, "Error: --pass and --action are required")
+			os.Exit(1)
+		}
+
+		passJWT := extractTokenString(*passFlag, "agentpass_token")
+		pass, err := agentpass.Verify(passJWT, keys.PublicKey, now)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error verifying AgentPass: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Pre-flight scope check: fail fast before prompting for hardware biometrics
+		permitted, err := pass.Permits(*actionFlag)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error evaluating tool action: %v\n", err)
+			os.Exit(1)
+		}
+		if !permitted {
+			fmt.Fprintf(os.Stderr, "Error: action '%s' is not permitted under AgentPass scope [%s]\n",
+				*actionFlag, strings.Join(pass.Scope, ", "))
+			os.Exit(1)
+		}
+
+		// Hardware presence / biometric step-up check
+		gate := agentpass.NewHardwareGate()
+		ctx := context.Background()
+		if err := gate.CheckAndAuthorize(ctx, pass, *actionFlag); err != nil {
+			fmt.Fprintf(os.Stderr, "Hardware gate authorization failed: %v\n", err)
+			os.Exit(1)
+		}
+
+		tok, signedTok, err := agentpass.MintToolToken(pass, *actionFlag, keys.PrivateKey, now)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error minting tool token: %v\n", err)
+			os.Exit(1)
+		}
+
+		output := map[string]any{
+			"task_token": signedTok,
+			"jti":        tok.JTI,
+			"sub":        tok.Subject,
+			"scope":      tok.Scope,
+			"expires_in": tok.ExpiresAt - now.Unix(),
+			"cnf":        tok.CNF,
+		}
+		enc, _ := json.MarshalIndent(output, "", "  ")
+		fmt.Println(string(enc))
+
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown agentpass subcommand: %s\n", args[0])
 		os.Exit(1)
 	}
 }

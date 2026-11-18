@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bonjoski/conjoiner/pkg/agentpass"
 	"github.com/bonjoski/conjoiner/pkg/mandate"
 	"github.com/bonjoski/conjoiner/pkg/mcp"
 	"github.com/bonjoski/conjoiner/pkg/token"
@@ -276,3 +277,73 @@ func TestEndToEndLifecycle_ZeroBackgroundWorkloadIdentityWorkflowScopeSanitizer(
 	}
 }
 
+func TestAgentPass_CLIEndToEndLifecycle(t *testing.T) {
+	os.Setenv("CONJOINER_MOCK_BIOMETRIC", "approved")
+	defer os.Unsetenv("CONJOINER_MOCK_BIOMETRIC")
+
+	now := time.Now()
+	keys, err := getOrGenerateBrokerKeys()
+	if err != nil {
+		t.Fatalf("failed getting broker keys: %v", err)
+	}
+
+	// Step 1: Issue Root Pass
+	rootOpts := agentpass.IssueOptions{
+		AgentID:         "agent:orchestrator",
+		HumanSupervisor: "benskolmoski@bonjo.dev",
+		Scope:           []string{"repo:read", "repo:write", "git:status", "git:commit"},
+		Lifetime:        1 * time.Hour,
+		TokenTTL:        30 * time.Second,
+	}
+
+	rootPass, rootSigned, err := agentpass.IssueRootPass(rootOpts, keys.PrivateKey, now)
+	if err != nil {
+		t.Fatalf("IssueRootPass failed: %v", err)
+	}
+
+	// Step 2: Attenuate Child Pass
+	childOpts := agentpass.AttenuateOptions{
+		RequestedScope: []string{"repo:read", "git:commit"},
+		ChildAgentID:   "agent:worker:01",
+		Lifetime:       30 * time.Minute,
+	}
+
+	childPass, childSigned, err := agentpass.AttenuatePass(rootPass, childOpts, keys.PrivateKey, now)
+	if err != nil {
+		t.Fatalf("AttenuatePass failed: %v", err)
+	}
+
+	// Step 3: Verify Child Pass
+	verified, err := agentpass.Verify(childSigned, keys.PublicKey, now)
+	if err != nil {
+		t.Fatalf("Verify failed: %v", err)
+	}
+	if verified.AgentID != "agent:worker:01" {
+		t.Errorf("expected child agent ID agent:worker:01, got: %s", verified.AgentID)
+	}
+	if verified.DelegationDepth != 1 {
+		t.Errorf("expected depth 1, got: %d", verified.DelegationDepth)
+	}
+
+	// Step 4: Mint 30s Tool Token for permitted action
+	tok, signedTok, err := agentpass.MintToolToken(childPass, "git:commit", keys.PrivateKey, now)
+	if err != nil {
+		t.Fatalf("MintToolToken failed: %v", err)
+	}
+
+	parsedTok, err := token.ParseAndVerifyToken(signedTok, keys.PublicKey, now)
+	if err != nil {
+		t.Fatalf("ParseAndVerifyToken failed: %v", err)
+	}
+	if parsedTok.JTI != tok.JTI {
+		t.Errorf("expected JTI %s, got %s", tok.JTI, parsedTok.JTI)
+	}
+
+	// Step 5: Privilege Escalation Attempt (Unpermitted action: "repo:write")
+	_, _, err = agentpass.MintToolToken(childPass, "repo:write", keys.PrivateKey, now)
+	if err == nil {
+		t.Fatalf("expected out-of-scope tool action to fail, but succeeded")
+	}
+
+	_ = rootSigned
+}
