@@ -4,7 +4,10 @@
 [![SLSA 2](https://slsa.dev/images/gh-badge-level2.svg)](https://slsa.dev)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-> **Sovereign Agentic IAM Broker & Policy Gateway**  
+> [!NOTE]
+> **Developer Tooling & Safe Harbor Scope**: Conjoiner is strictly an unmanaged local CLI utility and Go reference implementation of IETF RFC 9449 (DPoP) and NIST SP 800-207A tenets for personal developer agent workflows. It does not provide enterprise Identity Provider (IdP) services, centralized IAM, or fleet-wide policy servers.
+
+> **Deterministic Tool Gateway & RFC 9449 DPoP Token Reference Implementation**  
 > Implementing the NIST 10 Design Tenets for Agentic Non-Human Identity (NHI)
 
 ---
