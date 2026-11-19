@@ -32,6 +32,10 @@ var (
 	ErrATHMismatch = errors.New("dpop proof ath (access token hash) mismatch")
 	// ErrDPoPProofReplayed indicates proof jti has already been observed within the validity window.
 	ErrDPoPProofReplayed = errors.New("dpop proof replayed: jti already consumed")
+	// ErrDPoPNonceMismatch indicates proof nonce did not match expected nonce.
+	ErrDPoPNonceMismatch = errors.New("dpop proof nonce mismatch")
+	// ErrDPoPNonceRequired indicates an expected nonce was omitted from the proof.
+	ErrDPoPNonceRequired = errors.New("dpop proof missing required nonce")
 )
 
 // JWK represents an RFC 8037 Octet Key Pair (OKP) for Ed25519.
@@ -123,11 +127,12 @@ type DPoPHeader struct {
 
 // DPoPPayload defines the JWT claims for RFC 9449 DPoP proofs.
 type DPoPPayload struct {
-	JTI string `json:"jti"`           // Unique proof ID
-	HTM string `json:"htm"`           // HTTP method (or action string)
-	HTU string `json:"htu"`           // HTTP URI (or resource identifier)
-	IAT int64  `json:"iat"`           // Issued at epoch seconds
-	ATH string `json:"ath,omitempty"` // Access Token Hash
+	JTI   string `json:"jti"`             // Unique proof ID
+	HTM   string `json:"htm"`             // HTTP method (or action string)
+	HTU   string `json:"htu"`             // HTTP URI (or resource identifier)
+	IAT   int64  `json:"iat"`             // Issued at epoch seconds
+	ATH   string `json:"ath,omitempty"`   // Access Token Hash
+	Nonce string `json:"nonce,omitempty"` // Server- or session-bound anti-replay nonce
 }
 
 // ComputeATH computes the RFC 9449 access token hash: base64url(sha256(accessToken)).
@@ -150,6 +155,11 @@ func GenerateRandomJTI() (string, error) {
 
 // CreateProof generates an RFC 9449 compliant DPoP proof JWT.
 func (k *DPoPKey) CreateProof(htm, htu, accessToken string) (string, error) {
+	return k.CreateProofWithNonce(htm, htu, accessToken, "")
+}
+
+// CreateProofWithNonce generates an RFC 9449 compliant DPoP proof JWT with an explicit nonce.
+func (k *DPoPKey) CreateProofWithNonce(htm, htu, accessToken, nonce string) (string, error) {
 	if k.PrivateKey == nil {
 		return "", errors.New("cannot create proof: private key has been zeroized")
 	}
@@ -166,11 +176,12 @@ func (k *DPoPKey) CreateProof(htm, htu, accessToken string) (string, error) {
 	}
 
 	payload := DPoPPayload{
-		JTI: jti,
-		HTM: strings.ToUpper(htm),
-		HTU: htu,
-		IAT: time.Now().UTC().Unix(),
-		ATH: ComputeATH(accessToken),
+		JTI:   jti,
+		HTM:   strings.ToUpper(htm),
+		HTU:   htu,
+		IAT:   time.Now().UTC().Unix(),
+		ATH:   ComputeATH(accessToken),
+		Nonce: nonce,
 	}
 
 	headerJSON, err := json.Marshal(header)
@@ -194,20 +205,25 @@ func (k *DPoPKey) CreateProof(htm, htu, accessToken string) (string, error) {
 }
 
 // ValidateProof verifies an RFC 9449 DPoP proof JWT.
-// It verifies:
-// 1. JWT format (header.payload.signature)
-// 2. typ == "dpop+jwt" and alg == "EdDSA"
-// 3. JWK curve is Ed25519 and type is OKP
-// 4. Ed25519 signature validity
-// 5. iat timestamp within maxSkew window
-// 6. htm and htu match expectation
-// 7. ath matches hash of provided accessToken
-// 8. jti has not been replayed (via ReplayCache)
 func ValidateProof(
 	proofJWT string,
 	expectedMethod string,
 	expectedURI string,
 	accessToken string,
+	maxSkew time.Duration,
+	replayCache ReplayCache,
+	now time.Time,
+) (*DPoPPayload, *JWK, error) {
+	return ValidateProofWithNonce(proofJWT, expectedMethod, expectedURI, accessToken, "", maxSkew, replayCache, now)
+}
+
+// ValidateProofWithNonce verifies an RFC 9449 DPoP proof JWT, including nonce verification when expectedNonce is non-empty.
+func ValidateProofWithNonce(
+	proofJWT string,
+	expectedMethod string,
+	expectedURI string,
+	accessToken string,
+	expectedNonce string,
 	maxSkew time.Duration,
 	replayCache ReplayCache,
 	now time.Time,
@@ -295,6 +311,16 @@ func ValidateProof(
 		expectedATH := ComputeATH(accessToken)
 		if subtle.ConstantTimeCompare([]byte(payload.ATH), []byte(expectedATH)) != 1 {
 			return nil, nil, fmt.Errorf("%w: got '%s', expected '%s'", ErrATHMismatch, payload.ATH, expectedATH)
+		}
+	}
+
+	// Verify Nonce if expectedNonce is configured
+	if expectedNonce != "" {
+		if payload.Nonce == "" {
+			return nil, nil, ErrDPoPNonceRequired
+		}
+		if subtle.ConstantTimeCompare([]byte(payload.Nonce), []byte(expectedNonce)) != 1 {
+			return nil, nil, fmt.Errorf("%w: got '%s', expected '%s'", ErrDPoPNonceMismatch, payload.Nonce, expectedNonce)
 		}
 	}
 

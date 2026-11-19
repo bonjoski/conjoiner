@@ -23,6 +23,7 @@ type ToolInvocationRequest struct {
 	Arguments        []string                      `json:"arguments"`
 	Headers          map[string]string             `json:"headers,omitempty"`
 	SessionID        string                        `json:"session_id,omitempty"`
+	Nonce            string                        `json:"nonce,omitempty"`
 	WorkflowManifest *attenuation.WorkflowManifest `json:"workflow_manifest,omitempty"`
 }
 
@@ -43,24 +44,28 @@ var (
 
 // Gateway intercepts and deterministically authorizes tool requests.
 type Gateway struct {
-	brokerPubKey     ed25519.PublicKey
-	replayCache      token.ReplayCache
-	revocationStore  token.RevocationStore
-	policyEngine     PolicyEngine
-	executor         ToolExecutor
-	ledger           ledger.Ledger
-	workflowManifest *attenuation.WorkflowManifest
+	brokerPubKey        ed25519.PublicKey
+	replayCache         token.ReplayCache
+	revocationStore     token.RevocationStore
+	policyEngine        PolicyEngine
+	executor            ToolExecutor
+	ledger              ledger.Ledger
+	workflowManifest    *attenuation.WorkflowManifest
+	nonceTracker        *token.SessionNonceTracker
+	requireSessionNonce bool
 }
 
 // GatewayConfig defines dependencies for constructing a Gateway.
 type GatewayConfig struct {
-	BrokerPubKey     ed25519.PublicKey
-	ReplayCache      token.ReplayCache
-	RevocationStore  token.RevocationStore
-	PolicyEngine     PolicyEngine
-	Executor         ToolExecutor
-	Ledger           ledger.Ledger
-	WorkflowManifest *attenuation.WorkflowManifest
+	BrokerPubKey        ed25519.PublicKey
+	ReplayCache         token.ReplayCache
+	RevocationStore     token.RevocationStore
+	PolicyEngine        PolicyEngine
+	Executor            ToolExecutor
+	Ledger              ledger.Ledger
+	WorkflowManifest    *attenuation.WorkflowManifest
+	NonceTracker        *token.SessionNonceTracker
+	RequireSessionNonce bool
 }
 
 // NewGateway constructs a new Policy Gateway instance.
@@ -87,15 +92,20 @@ func NewGateway(cfg GatewayConfig) (*Gateway, error) {
 			return nil, fmt.Errorf("failed initializing default ledger: %w", err)
 		}
 	}
+	if cfg.NonceTracker == nil {
+		cfg.NonceTracker = token.NewSessionNonceTracker(cfg.ReplayCache, 60*time.Second)
+	}
 
 	return &Gateway{
-		brokerPubKey:     cfg.BrokerPubKey,
-		replayCache:      cfg.ReplayCache,
-		revocationStore:  cfg.RevocationStore,
-		policyEngine:     cfg.PolicyEngine,
-		executor:         cfg.Executor,
-		ledger:           cfg.Ledger,
-		workflowManifest: cfg.WorkflowManifest,
+		brokerPubKey:        cfg.BrokerPubKey,
+		replayCache:         cfg.ReplayCache,
+		revocationStore:     cfg.RevocationStore,
+		policyEngine:        cfg.PolicyEngine,
+		executor:            cfg.Executor,
+		ledger:              cfg.Ledger,
+		workflowManifest:    cfg.WorkflowManifest,
+		nonceTracker:        cfg.NonceTracker,
+		requireSessionNonce: cfg.RequireSessionNonce,
 	}, nil
 }
 
@@ -137,28 +147,6 @@ func (g *Gateway) Execute(ctx context.Context, req ToolInvocationRequest) (*Tool
 		return nil, ErrTokenRevoked
 	}
 
-	// 2. Validate DPoP Proof
-	// The proof must bind to action "EXEC" and target URI "tool://<toolName>"
-	expectedURI := fmt.Sprintf("tool://%s", req.ToolName)
-	_, dpopJWK, err := token.ValidateProof(
-		req.DPoPProof,
-		"EXEC",
-		expectedURI,
-		req.Token, // Validates ath hash against presented token
-		30*time.Second,
-		g.replayCache,
-		now,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("dpop proof validation failed: %w", err)
-	}
-
-	// 3. Verify DPoP Key Binding (RFC 9449: token cnf.jkt == proof JWK thumbprint)
-	dpopThumbprint := dpopJWK.Thumbprint()
-	if !tok.VerifyDPoPBinding(dpopThumbprint) {
-		return nil, token.ErrDPoPBindingMismatch
-	}
-
 	// CNJ-06: Bind audit SessionID strictly to authenticated signed token claims (sid -> sub -> jti)
 	// rather than trusting unauthenticated req.SessionID or headers.
 	sessionID := strings.TrimSpace(tok.SessionID)
@@ -169,6 +157,64 @@ func (g *Gateway) Execute(ctx context.Context, req ToolInvocationRequest) (*Tool
 		sessionID = strings.TrimSpace(tok.JTI)
 	}
 	sessionID = ledger.SanitizeSessionID(sessionID)
+
+	// Validate Session-Bound Nonce if provided or strictly required
+	nonce := strings.TrimSpace(req.Nonce)
+	if nonce == "" && req.Headers != nil {
+		if hNonce := req.Headers["DPoP-Nonce"]; hNonce != "" {
+			nonce = strings.TrimSpace(hNonce)
+		} else if hNonce := req.Headers["X-Session-Nonce"]; hNonce != "" {
+			nonce = strings.TrimSpace(hNonce)
+		}
+	}
+
+	if g.requireSessionNonce && nonce == "" {
+		return nil, fmt.Errorf("session-bound nonce is required for tool invocation: %w", token.ErrMissingSessionNonce)
+	}
+
+	if nonce != "" {
+		if g.nonceTracker != nil {
+			if err := g.nonceTracker.ValidateAndConsume(sessionID, nonce); err != nil {
+				return nil, fmt.Errorf("session-bound nonce validation failed: %w", err)
+			}
+		}
+	}
+
+	// 2. Validate DPoP Proof
+	// The proof must bind to action "EXEC" and target URI "tool://<toolName>"
+	expectedURI := fmt.Sprintf("tool://%s", req.ToolName)
+	var dpopJWK *token.JWK
+	if nonce != "" {
+		_, dpopJWK, err = token.ValidateProofWithNonce(
+			req.DPoPProof,
+			"EXEC",
+			expectedURI,
+			req.Token,
+			nonce,
+			30*time.Second,
+			g.replayCache,
+			now,
+		)
+	} else {
+		_, dpopJWK, err = token.ValidateProof(
+			req.DPoPProof,
+			"EXEC",
+			expectedURI,
+			req.Token, // Validates ath hash against presented token
+			30*time.Second,
+			g.replayCache,
+			now,
+		)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("dpop proof validation failed: %w", err)
+	}
+
+	// 3. Verify DPoP Key Binding (RFC 9449: token cnf.jkt == proof JWK thumbprint)
+	dpopThumbprint := dpopJWK.Thumbprint()
+	if !tok.VerifyDPoPBinding(dpopThumbprint) {
+		return nil, token.ErrDPoPBindingMismatch
+	}
 
 	// Extract Mandate signature and DPoP signature from tokens
 	mandateSig := extractJWTSignature(req.Token)

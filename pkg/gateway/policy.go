@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/bonjoski/conjoiner/pkg/attenuation"
@@ -19,7 +20,12 @@ var (
 	ErrCommandInjectionDetected = errors.New("potential command injection detected: illegal metacharacters in arguments")
 	// ErrPathTraversalDetected indicates path traversal attempt in resource path.
 	ErrPathTraversalDetected = errors.New("path traversal detected: directory escape attempt")
+	// ErrUnauthorizedReflectionDetected indicates an attempt to dump environment variables or MCP schemas.
+	ErrUnauthorizedReflectionDetected = errors.New("unauthorized reflection attempt: cannot dump environment variables or server schemas")
 )
+
+// Reflection regex detecting indirect prompt reflection targeting environment variables or MCP schemas.
+var reflectionRegex = regexp.MustCompile(`(?i)(?:(?:dump|print|reveal|leak|show|extract|export|reflect|echo|exfiltrate)\s+(?:all\s+)?(?:system\s+)?(?:env(?:ironment)?\s*(?:vars?|variables?)?|process\.env|mcp\s*(?:server\s*)?schemas?|tool\s*schemas?)|(?:env(?:ironment)?\s*(?:vars?|variables?)?|mcp\s*(?:server\s*)?schemas?|tool\s*schemas?)\s*(?:dump|leak|reflection|extraction))`)
 
 // Dangerous shell metacharacters that must never be accepted in arguments.
 var forbiddenMetachars = []string{
@@ -116,6 +122,11 @@ func (e *DeterministicPolicyEngine) Evaluate(ctx context.Context, tok *token.Tas
 					ErrCommandInjectionDetected, arg, meta)
 			}
 		}
+	}
+
+	// 1.5. Unauthorized Reflection Guard: prevent attempts to dump env vars or MCP schemas
+	if match := reflectionRegex.FindString(execCtx.ToolName + " " + execCtx.Action + " " + execCtx.Resource + " " + strings.Join(execCtx.Arguments, " ")); match != "" {
+		return fmt.Errorf("%w: matched reflection signature '%s'", ErrUnauthorizedReflectionDetected, match)
 	}
 
 	// 2. Path Traversal Check

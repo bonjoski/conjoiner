@@ -128,6 +128,8 @@ type Config struct {
 	AuditLogPath            string
 	RevocationStore         token.RevocationStore
 	CorrelationJTI          string
+	RequireSessionNonce     bool
+	NonceTracker            *token.SessionNonceTracker
 }
 
 // TransportShim coordinates bidirectional streaming JSON-RPC inspection.
@@ -143,6 +145,7 @@ type TransportShim struct {
 	pendingCorrelationJTI map[string]string
 	sanitizer             *Sanitizer
 	taintGate             TaintGate
+	nonceTracker          *token.SessionNonceTracker
 	pendingMu             sync.Mutex
 	pending               map[string]string // maps request ID string to method name
 }
@@ -300,6 +303,11 @@ func NewTransportShim(cfg Config) (*TransportShim, error) {
 		corrJTI = verifiedToken.JTI
 	}
 
+	nonceTracker := cfg.NonceTracker
+	if nonceTracker == nil {
+		nonceTracker = token.NewSessionNonceTracker(token.NewMemoryReplayCache(), 60*time.Second)
+	}
+
 	return &TransportShim{
 		cfg:                   cfg,
 		scopeSet:              scopeSet,
@@ -312,6 +320,7 @@ func NewTransportShim(cfg Config) (*TransportShim, error) {
 		pendingCorrelationJTI: make(map[string]string),
 		sanitizer:             NewSanitizer(),
 		taintGate:             tg,
+		nonceTracker:          nonceTracker,
 		pending:               make(map[string]string),
 	}, nil
 }
@@ -671,6 +680,51 @@ func (s *TransportShim) handleInboundLine(line []byte, _ io.Writer, clientOut io
 				LogPresenceRejection(s.cfg.AuditLogPath, params.Name, s.cfg.SessionID, err)
 				writeJSONRPCError(clientOut, msg.ID, ErrCodePolicyViolation,
 					"Zero-Background-Authority: User presence failed / locked")
+				return false
+			}
+		}
+
+		// 0c. Session-Bound Nonce Validation (anti-replay defense)
+		var nonceHolder struct {
+			Nonce string `json:"nonce"`
+			Meta  struct {
+				Nonce        string `json:"nonce"`
+				SessionNonce string `json:"session_nonce"`
+			} `json:"_meta"`
+		}
+		var callNonce string
+		if err := json.Unmarshal(paramsTrim, &nonceHolder); err == nil {
+			if nonceHolder.Nonce != "" {
+				callNonce = nonceHolder.Nonce
+			} else if nonceHolder.Meta.Nonce != "" {
+				callNonce = nonceHolder.Meta.Nonce
+			} else if nonceHolder.Meta.SessionNonce != "" {
+				callNonce = nonceHolder.Meta.SessionNonce
+			}
+		}
+
+		activeSessionID := s.cfg.SessionID
+		if s.verifiedToken != nil && s.verifiedToken.SessionID != "" {
+			activeSessionID = s.verifiedToken.SessionID
+		} else if s.verifiedToken != nil && s.verifiedToken.Subject != "" {
+			activeSessionID = s.verifiedToken.Subject
+		}
+
+		if s.cfg.RequireSessionNonce && callNonce == "" {
+			writeJSONRPCError(clientOut, msg.ID, ErrCodePolicyViolation,
+				"Conjoiner policy blocked tool call: missing required session-bound nonce")
+			return false
+		}
+
+		if callNonce != "" {
+			if err := s.nonceTracker.ValidateAndConsume(activeSessionID, callNonce); err != nil {
+				if errors.Is(err, token.ErrReplayDetected) {
+					writeJSONRPCError(clientOut, msg.ID, ErrCodePolicyViolation,
+						"Conjoiner policy blocked tool call: tool call replay detected (nonce already consumed)")
+					return false
+				}
+				writeJSONRPCError(clientOut, msg.ID, ErrCodePolicyViolation,
+					fmt.Sprintf("Conjoiner policy blocked tool call: invalid session-bound nonce: %v", err))
 				return false
 			}
 		}

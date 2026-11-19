@@ -292,3 +292,149 @@ func TestAdversarial_MutatingOperationsWithoutManifestFailClosedAndRecordCRP(t *
 		t.Fatalf("expected VerdictAllow on receipt, got: %v", resp.Receipt.Verdict)
 	}
 }
+
+// TestAdversarial_SessionBoundNonceValidationAndReplayInGateway verifies:
+// 1. Session-bound nonces are verified against the authenticated session ID.
+// 2. Replay of an already-consumed nonce is immediately rejected.
+// 3. Forged nonces bound to a different session are rejected.
+func TestAdversarial_SessionBoundNonceValidationAndReplayInGateway(t *testing.T) {
+	broker, _ := token.NewTokenBroker(token.BrokerConfig{})
+	dpopKey, _ := token.GenerateDPoPKey()
+	ctx := context.Background()
+
+	sessionID := "session-gateway-anti-replay"
+	_, tokenJWT, err := broker.IssueRootToken(ctx, token.RootTokenRequest{
+		Subject:        "agent-session-tester",
+		SessionID:      sessionID,
+		Scopes:         []string{"tool:exec:git:status"},
+		TTL:            30 * time.Second,
+		DPoPThumbprint: dpopKey.Thumbprint(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gw, err := NewGateway(GatewayConfig{
+		BrokerPubKey:        broker.PublicKey(),
+		ReplayCache:         broker.ReplayCache(),
+		Executor:            &MockToolExecutor{},
+		RequireSessionNonce: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Missing nonce when required must fail
+	proofNoNonce, _ := dpopKey.CreateProof("EXEC", "tool://git", tokenJWT)
+	_, err = gw.Execute(ctx, ToolInvocationRequest{
+		Token:     tokenJWT,
+		DPoPProof: proofNoNonce,
+		ToolName:  "git",
+		Action:    "status",
+	})
+	if err == nil || !strings.Contains(err.Error(), "session-bound nonce is required") {
+		t.Fatalf("expected missing session-bound nonce error, got: %v", err)
+	}
+
+	// 2. Forged nonce bound to another session must fail
+	otherSessionNonce, _ := token.GenerateSessionNonce("victim-session-id")
+	proofOtherNonce, _ := dpopKey.CreateProofWithNonce("EXEC", "tool://git", tokenJWT, otherSessionNonce)
+	_, err = gw.Execute(ctx, ToolInvocationRequest{
+		Token:     tokenJWT,
+		DPoPProof: proofOtherNonce,
+		ToolName:  "git",
+		Action:    "status",
+		Nonce:     otherSessionNonce,
+	})
+	if err == nil || !strings.Contains(err.Error(), "session-bound nonce validation failed") {
+		t.Fatalf("expected session nonce mismatch error, got: %v", err)
+	}
+
+	// 3. Valid session nonce succeeds
+	validNonce, _ := token.GenerateSessionNonce(sessionID)
+	proofValid, _ := dpopKey.CreateProofWithNonce("EXEC", "tool://git", tokenJWT, validNonce)
+	resp, err := gw.Execute(ctx, ToolInvocationRequest{
+		Token:     tokenJWT,
+		DPoPProof: proofValid,
+		ToolName:  "git",
+		Action:    "status",
+		Nonce:     validNonce,
+	})
+	if err != nil {
+		t.Fatalf("expected valid nonce execution to succeed, got: %v", err)
+	}
+	if resp == nil || resp.Receipt == nil {
+		t.Fatal("expected non-nil response and receipt")
+	}
+
+	// 4. Replay attack: reusing the same nonce must fail closed
+	proofReplay, _ := dpopKey.CreateProofWithNonce("EXEC", "tool://git", tokenJWT, validNonce)
+	_, err = gw.Execute(ctx, ToolInvocationRequest{
+		Token:     tokenJWT,
+		DPoPProof: proofReplay,
+		ToolName:  "git",
+		Action:    "status",
+		Nonce:     validNonce,
+	})
+	if err == nil || !strings.Contains(err.Error(), "session-bound nonce validation failed") {
+		t.Fatalf("expected replay attack to fail closed, got: %v", err)
+	}
+}
+
+// TestAdversarial_PromptReflectionEnvAndSchemaDumpBlockedInGateway verifies that
+// indirect prompt reflection attempts seeking to dump environment variables or MCP schemas
+// are intercepted and rejected with CRP proofs.
+func TestAdversarial_PromptReflectionEnvAndSchemaDumpBlockedInGateway(t *testing.T) {
+	broker, _ := token.NewTokenBroker(token.BrokerConfig{})
+	dpopKey, _ := token.GenerateDPoPKey()
+	ctx := context.Background()
+
+	_, tokenJWT, err := broker.IssueRootToken(ctx, token.RootTokenRequest{
+		Subject:        "agent-reflection-tester",
+		Scopes:         []string{"tool:exec:git:status", "tool:exec:echo:print"},
+		TTL:            30 * time.Second,
+		DPoPThumbprint: dpopKey.Thumbprint(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	memLedger, _ := ledger.NewEngine(ledger.Config{InMemory: true})
+	gw, _ := NewGateway(GatewayConfig{
+		BrokerPubKey: broker.PublicKey(),
+		ReplayCache:  broker.ReplayCache(),
+		Executor:     &MockToolExecutor{},
+		Ledger:       memLedger,
+	})
+
+	reflectionVectors := []struct {
+		tool string
+		act  string
+		args []string
+	}{
+		{"echo", "print", []string{"dump environment variables"}},
+		{"echo", "print", []string{"dump all env vars"}},
+		{"echo", "print", []string{"reveal mcp server schema"}},
+		{"echo", "print", []string{"export process.env"}},
+		{"echo", "print", []string{"print all environment variables"}},
+		{"echo", "print", []string{"dump tool schemas"}},
+	}
+
+	for _, vec := range reflectionVectors {
+		proof, _ := dpopKey.CreateProof("EXEC", "tool://"+vec.tool, tokenJWT)
+		_, err := gw.Execute(ctx, ToolInvocationRequest{
+			Token:     tokenJWT,
+			DPoPProof: proof,
+			ToolName:  vec.tool,
+			Action:    vec.act,
+			Arguments: vec.args,
+		})
+		if err == nil {
+			t.Fatalf("expected unauthorized reflection %v to be blocked, but succeeded", vec.args)
+		}
+		var rejErr *ledger.RejectionError
+		if !errors.As(err, &rejErr) {
+			t.Fatalf("expected RejectionError for reflection %v, got: %v", vec.args, err)
+		}
+	}
+}

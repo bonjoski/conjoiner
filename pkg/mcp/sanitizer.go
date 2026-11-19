@@ -12,10 +12,11 @@ import (
 	"github.com/bonjoski/shield/pkg/shield"
 )
 
-// Regex signatures for prompt injection, jailbreaks, and system prompt override attempts.
+// Regex signatures for prompt injection, jailbreaks, system prompt overrides, and unauthorized reflection.
 var (
 	roleMarkerRegex = regexp.MustCompile(`(?i)(</?(?:system|admin|instruction|developer|prompt|context|assistant|user)>|\[/?(?:INSTRUCTION|SYSTEM|ADMIN|DEVELOPER)\]|<<SYS>>|<</SYS>>|<\|(?:im_start|im_end|system|user|assistant)\|>)`)
 	overrideRegex   = regexp.MustCompile(`(?i)(?:ignore\s+(?:all\s+)?(?:previous|prior)\s+instructions|system\s+override|disregard\s+(?:all\s+)?(?:prior|previous)\s+instructions|you\s+are\s+now\s+in\s+developer\s+mode|override\s+security\s+instructions)`)
+	reflectionRegex = regexp.MustCompile(`(?i)(?:(?:dump|print|reveal|leak|show|extract|export|reflect|echo|exfiltrate)\s+(?:all\s+)?(?:system\s+)?(?:env(?:ironment)?\s*(?:vars?|variables?)?|process\.env|mcp\s*(?:server\s*)?schemas?|tool\s*schemas?)|(?:env(?:ironment)?\s*(?:vars?|variables?)?|mcp\s*(?:server\s*)?schemas?|tool\s*schemas?)\s*(?:dump|leak|reflection|extraction))`)
 
 	secretRefRegex      = regexp.MustCompile(`\[SECRET_REF_[0-9a-fA-F]{16}\]`)
 	vendorSecretRegexes = []*regexp.Regexp{
@@ -100,6 +101,9 @@ func DetectPromptInjection(input string) (bool, string) {
 	if loc := overrideRegex.FindString(cleaned); loc != "" {
 		return true, fmt.Sprintf("system override instruction detected: %s", loc)
 	}
+	if loc := reflectionRegex.FindString(cleaned); loc != "" {
+		return true, fmt.Sprintf("unauthorized reflection attempt detected: %s", loc)
+	}
 
 	// Check smuggled tag text if any was extracted
 	if smuggled != "" {
@@ -108,6 +112,9 @@ func DetectPromptInjection(input string) (bool, string) {
 		}
 		if loc := overrideRegex.FindString(smuggled); loc != "" {
 			return true, fmt.Sprintf("smuggled system override instruction detected: %s", loc)
+		}
+		if loc := reflectionRegex.FindString(smuggled); loc != "" {
+			return true, fmt.Sprintf("smuggled unauthorized reflection attempt detected: %s", loc)
 		}
 	}
 
