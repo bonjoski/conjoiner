@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/bonjoski/conjoiner/pkg/attenuation"
+	"github.com/bonjoski/conjoiner/pkg/containment"
+	"github.com/bonjoski/conjoiner/pkg/ledger"
 	"github.com/bonjoski/conjoiner/pkg/token"
 )
 
@@ -130,6 +132,13 @@ type Config struct {
 	CorrelationJTI          string
 	RequireSessionNonce     bool
 	NonceTracker            *token.SessionNonceTracker
+	Ledger                  ledger.Ledger
+	WorkspaceRoot           string
+	PathValidator           containment.InodeValidator
+	RequireDPoP             bool
+	DPoPReplayCache         token.ReplayCache
+	DPoPMaxSkew             time.Duration
+	UBMCPv1Errors           bool
 }
 
 // TransportShim coordinates bidirectional streaming JSON-RPC inspection.
@@ -146,6 +155,14 @@ type TransportShim struct {
 	sanitizer             *Sanitizer
 	taintGate             TaintGate
 	nonceTracker          *token.SessionNonceTracker
+	ledger                ledger.Ledger
+	workspaceRoot         string
+	pathValidator         containment.InodeValidator
+	dpopReplayCache       token.ReplayCache
+	dpopMaxSkew           time.Duration
+	ubMCPv1Errors         bool
+	lastSIRID             string
+	pendingSIRID          map[string]string
 	pendingMu             sync.Mutex
 	pending               map[string]string // maps request ID string to method name
 }
@@ -308,6 +325,29 @@ func NewTransportShim(cfg Config) (*TransportShim, error) {
 		nonceTracker = token.NewSessionNonceTracker(token.NewMemoryReplayCache(), 60*time.Second)
 	}
 
+	if strings.TrimSpace(cfg.SessionID) == "" {
+		if fabSess := strings.TrimSpace(os.Getenv("FABRIAL_SESSION_ID")); fabSess != "" {
+			cfg.SessionID = fabSess
+		}
+	}
+
+	wsRoot := strings.TrimSpace(cfg.WorkspaceRoot)
+	pathVal := cfg.PathValidator
+	if wsRoot != "" && pathVal == nil {
+		pathVal = containment.NewStrictPathValidator()
+	}
+
+	dpopCache := cfg.DPoPReplayCache
+	if dpopCache == nil {
+		dpopCache = token.NewMemoryReplayCache()
+	}
+	dpopSkew := cfg.DPoPMaxSkew
+	if dpopSkew <= 0 {
+		dpopSkew = 30 * time.Second
+	}
+
+	ubMCPv1 := cfg.UBMCPv1Errors || cfg.Ledger != nil || wsRoot != "" || cfg.RequireDPoP
+
 	return &TransportShim{
 		cfg:                   cfg,
 		scopeSet:              scopeSet,
@@ -321,6 +361,13 @@ func NewTransportShim(cfg Config) (*TransportShim, error) {
 		sanitizer:             NewSanitizer(),
 		taintGate:             tg,
 		nonceTracker:          nonceTracker,
+		ledger:                cfg.Ledger,
+		workspaceRoot:         wsRoot,
+		pathValidator:         pathVal,
+		dpopReplayCache:       dpopCache,
+		dpopMaxSkew:           dpopSkew,
+		ubMCPv1Errors:         ubMCPv1,
+		pendingSIRID:          make(map[string]string),
 		pending:               make(map[string]string),
 	}, nil
 }
@@ -332,10 +379,79 @@ func (s *TransportShim) ActiveCorrelationJTI() string {
 	return s.activeCorrelationJTI
 }
 
+// LastSIRID returns the most recently issued Conjoiner SIR ID formatted for BLPR-v1 lineage.
+func (s *TransportShim) LastSIRID() string {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	return s.lastSIRID
+}
+
+func (s *TransportShim) resolveSessionID() string {
+	if s.verifiedToken != nil && strings.TrimSpace(s.verifiedToken.SessionID) != "" {
+		return strings.TrimSpace(s.verifiedToken.SessionID)
+	}
+	if strings.TrimSpace(s.cfg.SessionID) != "" {
+		return strings.TrimSpace(s.cfg.SessionID)
+	}
+	if fab := strings.TrimSpace(os.Getenv("FABRIAL_SESSION_ID")); fab != "" {
+		return fab
+	}
+	return ""
+}
+
+func setEnvVar(env []string, key, value string) []string {
+	prefix := key + "="
+	for i, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			env[i] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
+}
+
+func (s *TransportShim) buildChildEnv(environ []string) []string {
+	clean := SanitizeChildEnv(environ)
+	sessID := s.resolveSessionID()
+	if sessID != "" {
+		clean = setEnvVar(clean, "FABRIAL_SESSION_ID", sessID)
+	}
+
+	sirID := s.LastSIRID()
+	if sirID == "" && s.ledger != nil {
+		sessionForSIR := sessID
+		if sessionForSIR == "" {
+			sessionForSIR = "default"
+		}
+		agentID := "mcp-shim"
+		if s.verifiedToken != nil && s.verifiedToken.Subject != "" {
+			agentID = s.verifiedToken.Subject
+		}
+		rec, err := s.ledger.Record(context.Background(), ledger.IntentRecord{
+			SessionID:     sessionForSIR,
+			AgentIdentity: agentID,
+			ToolName:      "mcp-shim:session",
+			Action:        "session/start",
+			Resource:      s.cfg.TargetCommand,
+			Verdict:       ledger.VerdictAllow,
+		})
+		if err == nil && rec != nil {
+			sirID = FormatBLPRReceiptID(rec.ReceiptID)
+			s.pendingMu.Lock()
+			s.lastSIRID = sirID
+			s.pendingMu.Unlock()
+		}
+	}
+	if sirID != "" {
+		clean = setEnvVar(clean, "CONJOINER_SIR_ID", sirID)
+	}
+	return clean
+}
+
 // Run executes the target command subprocess and transparently pipes stdin/stdout through security filters.
 func (s *TransportShim) Run(ctx context.Context, clientIn io.Reader, clientOut io.Writer, clientErr io.Writer) error {
 	cmd := exec.CommandContext(ctx, s.cfg.TargetCommand, s.cfg.TargetArgs...)
-	cmd.Env = SanitizeChildEnv(os.Environ())
+	cmd.Env = s.buildChildEnv(os.Environ())
 
 	childStdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -446,6 +562,34 @@ func writeJSONRPCError(w io.Writer, id json.RawMessage, code int, message string
 	_, _ = w.Write(respBytes)
 }
 
+func (s *TransportShim) writeToolDenial(w io.Writer, id json.RawMessage, legacyCode int, legacyMessage string, ubErr UBMCPv1Error) {
+	if w == nil {
+		return
+	}
+	toolRes := NewUBMCPv1ErrorResult(ubErr)
+	if s.ubMCPv1Errors {
+		resp, err := NewSuccessResponse(id, toolRes)
+		if err != nil {
+			return
+		}
+		respBytes, err := json.Marshal(resp)
+		if err != nil {
+			return
+		}
+		respBytes = append(respBytes, '\n')
+		_, _ = w.Write(respBytes)
+		return
+	}
+
+	errResp := NewErrorResponseWithData(id, legacyCode, legacyMessage, toolRes.StructuredContent)
+	respBytes, err := json.Marshal(errResp)
+	if err != nil {
+		return
+	}
+	respBytes = append(respBytes, '\n')
+	_, _ = w.Write(respBytes)
+}
+
 // pipeClientToServer processes inbound JSON-RPC messages from client IDE to MCP server.
 func (s *TransportShim) pipeClientToServer(r io.Reader, serverIn io.Writer, clientOut io.Writer) error {
 	reader := bufio.NewReaderSize(r, 64*1024)
@@ -464,10 +608,14 @@ func (s *TransportShim) pipeClientToServer(r io.Reader, serverIn io.Writer, clie
 		if len(line) > 0 {
 			trimmed := bytes.TrimSpace(line)
 			if len(trimmed) > 0 {
-				if shouldForward := s.handleInboundLine(trimmed, serverIn, clientOut); !shouldForward {
+				forwarded, shouldForward := s.processInboundLine(trimmed, clientOut)
+				if !shouldForward {
 					continue
 				}
-				if _, wErr := serverIn.Write(line); wErr != nil {
+				if !bytes.HasSuffix(forwarded, []byte("\n")) {
+					forwarded = append(forwarded, '\n')
+				}
+				if _, wErr := serverIn.Write(forwarded); wErr != nil {
 					return wErr
 				}
 			}
@@ -550,6 +698,7 @@ func hasDuplicateJSONKeys(data []byte) bool {
 }
 
 // HandleInboundLine evaluates and filters an inbound JSON-RPC message.
+// If permitted and serverIn is non-nil, writes the (potentially lineage-enriched) frame to serverIn.
 func (s *TransportShim) HandleInboundLine(line []byte, serverIn io.Writer, clientOut io.Writer) bool {
 	return s.handleInboundLine(line, serverIn, clientOut)
 }
@@ -559,50 +708,232 @@ func (s *TransportShim) HandleOutboundLine(line []byte) []byte {
 	return s.handleOutboundLine(line)
 }
 
-// handleInboundLine checks permissions and prompt injection on inbound client messages.
-// Fails closed (returns false and writes JSON-RPC error) on batch arrays, malformed JSON, or policy violations.
-func (s *TransportShim) handleInboundLine(line []byte, _ io.Writer, clientOut io.Writer) bool {
+func (s *TransportShim) handleInboundLine(line []byte, serverIn io.Writer, clientOut io.Writer) bool {
+	forwarded, ok := s.processInboundLine(line, clientOut)
+	if ok && serverIn != nil {
+		if !bytes.HasSuffix(forwarded, []byte("\n")) {
+			forwarded = append(forwarded, '\n')
+		}
+		_, _ = serverIn.Write(forwarded)
+	}
+	return ok
+}
+
+func (s *TransportShim) recordSIR(sessionID, toolName, dpopSig string, rawArgs json.RawMessage, verdict ledger.PolicyVerdict, reason string) string {
+	if s.ledger == nil {
+		return ""
+	}
+	if strings.TrimSpace(sessionID) == "" {
+		sessionID = "default"
+	}
+	agentID := "mcp-agent"
+	if s.verifiedToken != nil && s.verifiedToken.Subject != "" {
+		agentID = s.verifiedToken.Subject
+	}
+	var argSlice []string
+	if len(rawArgs) > 0 {
+		argSlice = []string{string(rawArgs)}
+	}
+	intent := ledger.IntentRecord{
+		SessionID:      sessionID,
+		AgentIdentity:  agentID,
+		ToolName:       toolName,
+		Action:         "tools/call",
+		ArgumentDigest: ledger.ComputeArgumentDigest(toolName, "tools/call", "", argSlice),
+		DPoPSignature:  dpopSig,
+		Verdict:        verdict,
+		RejectionReason: reason,
+	}
+
+	var receiptID string
+	if verdict == ledger.VerdictAllow {
+		if rec, err := s.ledger.Record(context.Background(), intent); err == nil && rec != nil {
+			receiptID = FormatBLPRReceiptID(rec.ReceiptID)
+		}
+	} else {
+		if proof, err := s.ledger.RecordRejection(context.Background(), intent); err == nil && proof != nil && proof.Receipt != nil {
+			receiptID = FormatBLPRReceiptID(proof.Receipt.ReceiptID)
+		}
+	}
+	if receiptID != "" {
+		s.pendingMu.Lock()
+		s.lastSIRID = receiptID
+		s.pendingMu.Unlock()
+	}
+	return receiptID
+}
+
+func sanitizeSafeToolLabel(toolName string) string {
+	clean := sanitizeUBText(toolName)
+	if clean == "" || len(clean) > 64 {
+		return "<redacted-tool>"
+	}
+	if injected, _ := DetectPromptInjection(clean); injected {
+		return "<redacted-tool>"
+	}
+	for _, r := range clean {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == ':' || r == '.') {
+			return "<redacted-tool>"
+		}
+	}
+	return clean
+}
+
+var pathArgumentKeys = map[string]bool{
+	"path":          true,
+	"file":          true,
+	"file_path":     true,
+	"filepath":      true,
+	"target_path":   true,
+	"target":        true,
+	"dir":           true,
+	"directory":     true,
+	"workspace":     true,
+	"root":          true,
+	"manifest_path": true,
+	"output":        true,
+	"dest":          true,
+	"source":        true,
+	"src":           true,
+}
+
+func (s *TransportShim) validateArgumentPaths(rawArgs json.RawMessage) error {
+	if s.workspaceRoot == "" || s.pathValidator == nil || len(rawArgs) == 0 {
+		return nil
+	}
+	var decoded any
+	if err := json.Unmarshal(rawArgs, &decoded); err != nil {
+		return nil
+	}
+	return s.walkAndValidatePaths(decoded)
+}
+
+func (s *TransportShim) walkAndValidatePaths(v any) error {
+	switch node := v.(type) {
+	case map[string]any:
+		for k, val := range node {
+			if pathArgumentKeys[strings.ToLower(strings.TrimSpace(k))] {
+				if p, ok := val.(string); ok && strings.TrimSpace(p) != "" {
+					if _, err := s.pathValidator.ValidatePath(s.workspaceRoot, p); err != nil {
+						return err
+					}
+				}
+			}
+			if err := s.walkAndValidatePaths(val); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for _, item := range node {
+			if err := s.walkAndValidatePaths(item); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func injectLineageIntoInboundFrame(trimmed []byte, sessionID, sirID string) []byte {
+	if sessionID == "" && sirID == "" {
+		return trimmed
+	}
+	var msgObj map[string]any
+	if err := json.Unmarshal(trimmed, &msgObj); err != nil {
+		return trimmed
+	}
+	paramsObj, ok := msgObj["params"].(map[string]any)
+	if !ok {
+		return trimmed
+	}
+	metaObj, ok := paramsObj["_meta"].(map[string]any)
+	if !ok {
+		metaObj = make(map[string]any)
+	}
+	if sessionID != "" {
+		metaObj["FABRIAL_SESSION_ID"] = sessionID
+	}
+	if sirID != "" {
+		metaObj["CONJOINER_SIR_ID"] = sirID
+	}
+	paramsObj["_meta"] = metaObj
+	msgObj["params"] = paramsObj
+	out, err := json.Marshal(msgObj)
+	if err != nil {
+		return trimmed
+	}
+	return out
+}
+
+// processInboundLine checks permissions, DPoP, path containment, taint, and prompt injection on inbound client messages.
+// Fails closed (returns nil, false and writes an error/UB-MCP-v1 CallToolResult) on batch arrays, malformed JSON, or policy violations.
+func (s *TransportShim) processInboundLine(line []byte, clientOut io.Writer) ([]byte, bool) {
 	trimmed := bytes.TrimSpace(line)
 	if len(trimmed) == 0 {
-		return false
+		return nil, false
 	}
 
 	// CNJ-03: Explicitly reject JSON-RPC batch arrays `[...]` (fail closed)
 	if trimmed[0] == '[' {
 		writeJSONRPCError(clientOut, nil, ErrCodeInvalidRequest, "Conjoiner policy rejected JSON-RPC batch array: single-request framing required")
-		return false
+		return nil, false
 	}
 	if trimmed[0] != '{' {
 		writeJSONRPCError(clientOut, nil, ErrCodeParseError, "Conjoiner policy rejected non-object JSON-RPC frame")
-		return false
+		return nil, false
 	}
 
 	if hasDuplicateJSONKeys(trimmed) {
 		writeJSONRPCError(clientOut, nil, ErrCodeInvalidRequest, "Conjoiner policy rejected JSON-RPC frame with duplicate object keys")
-		return false
+		return nil, false
 	}
 
 	var msg JSONRPCMessage
 	if err := json.Unmarshal(trimmed, &msg); err != nil {
 		writeJSONRPCError(clientOut, nil, ErrCodeParseError, "Conjoiner policy rejected malformed JSON-RPC message")
-		return false
+		return nil, false
 	}
 
 	if msg.JSONRPC != "" && msg.JSONRPC != "2.0" {
 		writeJSONRPCError(clientOut, msg.ID, ErrCodeInvalidRequest, "Unsupported JSON-RPC version")
-		return false
+		return nil, false
 	}
 
 	// Enforce live token TTL when configured with a verified TaskToken
 	if s.verifiedToken != nil && s.verifiedToken.IsExpired(time.Now().UTC()) {
+		if msg.Method == "tools/call" && s.ubMCPv1Errors {
+			sirID := s.recordSIR(s.resolveSessionID(), "tools/call", "", nil, ledger.VerdictDenyScope, "task token expired")
+			s.writeToolDenial(clientOut, msg.ID, ErrCodeTokenExpired, "Conjoiner task token has expired", UBMCPv1Error{
+				Code:           "CONJOINER_TOKEN_EXPIRED",
+				ExitCode:       ExitCodePolicyDeny,
+				Retryable:      true,
+				Summary:        "Paused tool call: Conjoiner ephemeral task token has expired.",
+				RemediationCmd: "conjoiner token issue --ttl 30s",
+				Why:            "Ephemeral 30-second tokens limit blast radius and must be refreshed before invoking tools.",
+				ReceiptID:      sirID,
+			})
+			return nil, false
+		}
 		writeJSONRPCError(clientOut, msg.ID, ErrCodeTokenExpired, "Conjoiner task token has expired")
-		return false
+		return nil, false
 	}
 
 	// Enforce live token revocation when configured with a verified TaskToken
 	if s.verifiedToken != nil && s.revocationStore != nil && s.revocationStore.IsRevoked(s.verifiedToken.JTI, s.verifiedToken.SessionID, s.verifiedToken.Subject) {
+		if msg.Method == "tools/call" && s.ubMCPv1Errors {
+			sirID := s.recordSIR(s.resolveSessionID(), "tools/call", "", nil, ledger.VerdictDenyScope, "task token revoked")
+			s.writeToolDenial(clientOut, msg.ID, ErrCodePolicyViolation, "Conjoiner task token has been revoked", UBMCPv1Error{
+				Code:           "CONJOINER_TOKEN_REVOKED",
+				ExitCode:       ExitCodePolicyDeny,
+				Retryable:      false,
+				Summary:        "Paused tool call: Conjoiner task token has been revoked.",
+				RemediationCmd: "fabrial session begin",
+				Why:            "Revoked tokens are permanently rejected to halt compromised or ended agent sessions.",
+				ReceiptID:      sirID,
+			})
+			return nil, false
+		}
 		writeJSONRPCError(clientOut, msg.ID, ErrCodePolicyViolation, "Conjoiner task token has been revoked")
-		return false
+		return nil, false
 	}
 
 	reqJTI := s.activeCorrelationJTI
@@ -622,7 +953,9 @@ func (s *TransportShim) handleInboundLine(line []byte, _ io.Writer, clientOut io
 		}
 	}
 	if reqJTI != "" {
+		s.pendingMu.Lock()
 		s.activeCorrelationJTI = reqJTI
+		s.pendingMu.Unlock()
 	}
 
 	idStr := string(msg.ID)
@@ -637,26 +970,31 @@ func (s *TransportShim) handleInboundLine(line []byte, _ io.Writer, clientOut io
 
 	if strings.HasPrefix(msg.Method, "tools/") && msg.Method != "tools/list" && msg.Method != "tools/call" {
 		writeJSONRPCError(clientOut, msg.ID, ErrCodeMethodNotFound, fmt.Sprintf("Unsupported MCP tools method: %s", msg.Method))
-		return false
+		return nil, false
 	}
 
 	if msg.Method == "tools/call" {
 		paramsTrim := bytes.TrimSpace(msg.Params)
 		if len(paramsTrim) == 0 || paramsTrim[0] != '{' {
 			writeJSONRPCError(clientOut, msg.ID, ErrCodeInvalidParams, "Malformed or missing tools/call params object")
-			return false
+			return nil, false
 		}
 
 		var params ToolCallParams
 		if err := json.Unmarshal(paramsTrim, &params); err != nil || strings.TrimSpace(params.Name) == "" {
 			writeJSONRPCError(clientOut, msg.ID, ErrCodeInvalidParams, "Invalid tools/call parameters: tool name is required")
-			return false
+			return nil, false
+		}
+
+		activeSessionID := s.resolveSessionID()
+		if activeSessionID == "" && s.verifiedToken != nil && s.verifiedToken.Subject != "" {
+			activeSessionID = s.verifiedToken.Subject
 		}
 
 		// 0a. Validate Token/Session revocation status on tool dispatch
 		if s.revocationStore != nil {
-			checkJTI := s.activeCorrelationJTI
-			checkSID := s.cfg.SessionID
+			checkJTI := s.ActiveCorrelationJTI()
+			checkSID := activeSessionID
 			checkSub := ""
 			if s.verifiedToken != nil {
 				checkJTI = s.verifiedToken.JTI
@@ -664,9 +1002,19 @@ func (s *TransportShim) handleInboundLine(line []byte, _ io.Writer, clientOut io
 				checkSub = s.verifiedToken.Subject
 			}
 			if s.revocationStore.IsRevoked(checkJTI, checkSID, checkSub) {
-				writeJSONRPCError(clientOut, msg.ID, ErrCodePolicyViolation,
-					"Conjoiner policy blocked tool call: task token has been revoked")
-				return false
+				sirID := s.recordSIR(activeSessionID, params.Name, "", params.Arguments, ledger.VerdictDenyScope, "task token revoked")
+				s.writeToolDenial(clientOut, msg.ID, ErrCodePolicyViolation,
+					"Conjoiner policy blocked tool call: task token has been revoked",
+					UBMCPv1Error{
+						Code:           "CONJOINER_TOKEN_REVOKED",
+						ExitCode:       ExitCodePolicyDeny,
+						Retryable:      false,
+						Summary:        "Paused tool call: task token has been revoked.",
+						RemediationCmd: "fabrial session begin",
+						Why:            "Revoked tokens are immediately blocked across all MCP tool calls.",
+						ReceiptID:      sirID,
+					})
+				return nil, false
 			}
 		}
 
@@ -677,80 +1025,221 @@ func (s *TransportShim) handleInboundLine(line []byte, _ io.Writer, clientOut io
 				checker = NewDefaultPresenceChecker()
 			}
 			if err := checker.CheckPresence(context.Background()); err != nil {
-				LogPresenceRejection(s.cfg.AuditLogPath, params.Name, s.cfg.SessionID, err)
-				writeJSONRPCError(clientOut, msg.ID, ErrCodePolicyViolation,
-					"Zero-Background-Authority: User presence failed / locked")
-				return false
+				LogPresenceRejection(s.cfg.AuditLogPath, params.Name, activeSessionID, err)
+				sirID := s.recordSIR(activeSessionID, params.Name, "", params.Arguments, ledger.VerdictDenyScope, "hardware presence failed")
+				s.writeToolDenial(clientOut, msg.ID, ErrCodePolicyViolation,
+					"Zero-Background-Authority: User presence failed / locked",
+					UBMCPv1Error{
+						Code:           "CONJOINER_PRESENCE_REQUIRED",
+						ExitCode:       ExitCodePolicyDeny,
+						Retryable:      true,
+						Summary:        "Paused tool call: active local user presence is required while workstation is unlocked.",
+						RemediationCmd: "conjoiner explain dpop --why",
+						Why:            "Zero-Background-Authority prevents unattended agents from invoking tools while the workstation is locked.",
+						ReceiptID:      sirID,
+					})
+				return nil, false
 			}
 		}
 
-		// 0c. Session-Bound Nonce Validation (anti-replay defense)
-		var nonceHolder struct {
+		// 0c. Session-Bound Nonce & DPoP Proof Extraction
+		var authMetaHolder struct {
 			Nonce string `json:"nonce"`
+			DPoP  string `json:"dpop"`
 			Meta  struct {
 				Nonce        string `json:"nonce"`
 				SessionNonce string `json:"session_nonce"`
+				DPoP         string `json:"dpop"`
+				DPoPAlt      string `json:"DPoP"`
 			} `json:"_meta"`
 		}
-		var callNonce string
-		if err := json.Unmarshal(paramsTrim, &nonceHolder); err == nil {
-			if nonceHolder.Nonce != "" {
-				callNonce = nonceHolder.Nonce
-			} else if nonceHolder.Meta.Nonce != "" {
-				callNonce = nonceHolder.Meta.Nonce
-			} else if nonceHolder.Meta.SessionNonce != "" {
-				callNonce = nonceHolder.Meta.SessionNonce
+		var callNonce, callDPoP string
+		if err := json.Unmarshal(paramsTrim, &authMetaHolder); err == nil {
+			if authMetaHolder.Nonce != "" {
+				callNonce = authMetaHolder.Nonce
+			} else if authMetaHolder.Meta.Nonce != "" {
+				callNonce = authMetaHolder.Meta.Nonce
+			} else if authMetaHolder.Meta.SessionNonce != "" {
+				callNonce = authMetaHolder.Meta.SessionNonce
+			}
+			if authMetaHolder.DPoP != "" {
+				callDPoP = authMetaHolder.DPoP
+			} else if authMetaHolder.Meta.DPoP != "" {
+				callDPoP = authMetaHolder.Meta.DPoP
+			} else if authMetaHolder.Meta.DPoPAlt != "" {
+				callDPoP = authMetaHolder.Meta.DPoPAlt
 			}
 		}
 
-		activeSessionID := s.cfg.SessionID
-		if s.verifiedToken != nil && s.verifiedToken.SessionID != "" {
-			activeSessionID = s.verifiedToken.SessionID
-		} else if s.verifiedToken != nil && s.verifiedToken.Subject != "" {
-			activeSessionID = s.verifiedToken.Subject
-		}
-
 		if s.cfg.RequireSessionNonce && callNonce == "" {
-			writeJSONRPCError(clientOut, msg.ID, ErrCodePolicyViolation,
-				"Conjoiner policy blocked tool call: missing required session-bound nonce")
-			return false
+			sirID := s.recordSIR(activeSessionID, params.Name, "", params.Arguments, ledger.VerdictDenyScope, "missing required session-bound nonce")
+			s.writeToolDenial(clientOut, msg.ID, ErrCodePolicyViolation,
+				"Conjoiner policy blocked tool call: missing required session-bound nonce",
+				UBMCPv1Error{
+					Code:           "CONJOINER_NONCE_REQUIRED",
+					ExitCode:       ExitCodePolicyDeny,
+					Retryable:      true,
+					Summary:        "Paused tool call: missing required session-bound anti-replay nonce.",
+					RemediationCmd: "conjoiner explain dpop --why",
+					Why:            "Session-bound nonces prevent replayed tool invocations across MCP sessions.",
+					ReceiptID:      sirID,
+				})
+			return nil, false
 		}
 
 		if callNonce != "" {
 			if err := s.nonceTracker.ValidateAndConsume(activeSessionID, callNonce); err != nil {
+				sirID := s.recordSIR(activeSessionID, params.Name, "", params.Arguments, ledger.VerdictDenyScope, "session-bound nonce validation failed")
 				if errors.Is(err, token.ErrReplayDetected) {
-					writeJSONRPCError(clientOut, msg.ID, ErrCodePolicyViolation,
-						"Conjoiner policy blocked tool call: tool call replay detected (nonce already consumed)")
-					return false
+					s.writeToolDenial(clientOut, msg.ID, ErrCodePolicyViolation,
+						"Conjoiner policy blocked tool call: tool call replay detected (nonce already consumed)",
+						UBMCPv1Error{
+							Code:           "CONJOINER_NONCE_REPLAY",
+							ExitCode:       ExitCodePolicyDeny,
+							Retryable:      true,
+							Summary:        "Paused tool call: replayed session-bound nonce detected.",
+							RemediationCmd: "conjoiner explain dpop --why",
+							Why:            "Each session-bound nonce can be consumed only once to neutralize replay attacks.",
+							ReceiptID:      sirID,
+						})
+					return nil, false
 				}
-				writeJSONRPCError(clientOut, msg.ID, ErrCodePolicyViolation,
-					fmt.Sprintf("Conjoiner policy blocked tool call: invalid session-bound nonce: %v", err))
-				return false
+				s.writeToolDenial(clientOut, msg.ID, ErrCodePolicyViolation,
+					fmt.Sprintf("Conjoiner policy blocked tool call: invalid session-bound nonce: %v", err),
+					UBMCPv1Error{
+						Code:           "CONJOINER_NONCE_INVALID",
+						ExitCode:       ExitCodePolicyDeny,
+						Retryable:      true,
+						Summary:        "Paused tool call: session-bound nonce failed validation.",
+						RemediationCmd: "conjoiner explain dpop --why",
+						Why:            "Tool calls must present a fresh nonce bound to the active session identifier.",
+						ReceiptID:      sirID,
+					})
+				return nil, false
+			}
+		}
+
+		// 0d. RFC 9449 DPoP Proof Validation
+		if s.cfg.RequireDPoP || callDPoP != "" {
+			if strings.TrimSpace(callDPoP) == "" {
+				sirID := s.recordSIR(activeSessionID, params.Name, "", params.Arguments, ledger.VerdictDenyScope, "missing required DPoP proof")
+				s.writeToolDenial(clientOut, msg.ID, ErrCodePolicyViolation,
+					"Conjoiner policy blocked tool call: missing required RFC 9449 DPoP proof",
+					UBMCPv1Error{
+						Code:           "CONJOINER_DPOP_INVALID",
+						ExitCode:       ExitCodePolicyDeny,
+						Retryable:      true,
+						Summary:        "Paused tool call: missing required RFC 9449 DPoP proof.",
+						RemediationCmd: "conjoiner explain dpop --why",
+						Why:            "DPoP binds each tool invocation to the agent's ephemeral Ed25519 keypair to defeat bearer token theft.",
+						ReceiptID:      sirID,
+					})
+				return nil, false
+			}
+			_, jwk, dpopErr := token.ValidateProofWithNonce(
+				callDPoP,
+				MCPDPoPMethod,
+				MCPDPoPURI(params.Name),
+				s.cfg.Token,
+				callNonce,
+				s.dpopMaxSkew,
+				s.dpopReplayCache,
+				time.Now().UTC(),
+			)
+			if dpopErr == nil && s.verifiedToken != nil && s.verifiedToken.CNF.JKT != "" {
+				if !s.verifiedToken.VerifyDPoPBinding(jwk.Thumbprint()) {
+					dpopErr = errors.New("DPoP key thumbprint does not match task token cnf.jkt binding")
+				}
+			}
+			if dpopErr != nil {
+				sirID := s.recordSIR(activeSessionID, params.Name, callDPoP, params.Arguments, ledger.VerdictDenyScope, "DPoP validation failed")
+				s.writeToolDenial(clientOut, msg.ID, ErrCodePolicyViolation,
+					"Conjoiner policy blocked tool call: RFC 9449 DPoP proof failed verification",
+					UBMCPv1Error{
+						Code:           "CONJOINER_DPOP_INVALID",
+						ExitCode:       ExitCodePolicyDeny,
+						Retryable:      true,
+						Summary:        "Paused tool call: RFC 9449 DPoP proof failed verification.",
+						RemediationCmd: "conjoiner explain dpop --why",
+						Why:            "DPoP proof signatures, URI bindings, freshness, and key thumbprints must verify before executing tools.",
+						ReceiptID:      sirID,
+					})
+				return nil, false
 			}
 		}
 
 		// 1. Semantic firewall: check tool name and arguments (raw + decoded JSON strings) for prompt injection
 		if injected, reason := DetectPromptInjection(params.Name); injected {
-			writeJSONRPCError(clientOut, msg.ID, ErrCodePromptInjectionDetected, fmt.Sprintf("Conjoiner policy blocked tool call: %s", reason))
-			return false
+			sirID := s.recordSIR(activeSessionID, params.Name, callDPoP, params.Arguments, ledger.VerdictDenyDrift, "prompt injection in tool name")
+			s.writeToolDenial(clientOut, msg.ID, ErrCodePromptInjectionDetected,
+				fmt.Sprintf("Conjoiner policy blocked tool call: %s", reason),
+				UBMCPv1Error{
+					Code:           "CONJOINER_DENY_DRIFT",
+					ExitCode:       ExitCodePolicyDeny,
+					Retryable:      false,
+					Summary:        "Paused tool call: prompt-injection or unauthorized reflection pattern detected in tool name.",
+					RemediationCmd: "conjoiner explain mcp --why",
+					Why:            "Conjoiner blocks prompt-injection directives and role markers before forwarding requests to MCP servers.",
+					ReceiptID:      sirID,
+				})
+			return nil, false
 		}
 		if len(params.Arguments) > 0 {
 			if injected, reason := DetectJSONPromptInjection(params.Arguments); injected {
-				writeJSONRPCError(clientOut, msg.ID, ErrCodePromptInjectionDetected, fmt.Sprintf("Conjoiner policy blocked tool call: %s", reason))
-				return false
+				sirID := s.recordSIR(activeSessionID, params.Name, callDPoP, params.Arguments, ledger.VerdictDenyDrift, "prompt injection in tool arguments")
+				s.writeToolDenial(clientOut, msg.ID, ErrCodePromptInjectionDetected,
+					fmt.Sprintf("Conjoiner policy blocked tool call: %s", reason),
+					UBMCPv1Error{
+						Code:           "CONJOINER_DENY_DRIFT",
+						ExitCode:       ExitCodePolicyDeny,
+						Retryable:      false,
+						Summary:        "Paused tool call: prompt-injection or unauthorized reflection pattern detected in arguments.",
+						RemediationCmd: "conjoiner explain mcp --why",
+						Why:            "Untrusted tool arguments containing instruction overrides or role tags are blocked fail-closed.",
+						ReceiptID:      sirID,
+					})
+				return nil, false
 			}
 		}
 
 		// 1b. Dynamic Taint Gate: intercept multi-step exfiltration on egress tools
 		if s.taintGate != nil && IsEgressToolName(params.Name) {
-			sessionID := s.cfg.SessionID
-			if sessionID == "" {
-				sessionID = "default"
+			taintSessionID := activeSessionID
+			if taintSessionID == "" {
+				taintSessionID = "default"
 			}
-			if allowed, reason := s.taintGate.EvaluateEgress(sessionID, params.Name, params.Arguments); !allowed {
-				writeJSONRPCError(clientOut, msg.ID, ErrCodeTaintViolation, fmt.Sprintf("Conjoiner policy blocked egress: %s", reason))
-				return false
+			if allowed, reason := s.taintGate.EvaluateEgress(taintSessionID, params.Name, params.Arguments); !allowed {
+				sirID := s.recordSIR(activeSessionID, params.Name, callDPoP, params.Arguments, ledger.VerdictDenyDrift, "taint gate egress violation")
+				s.writeToolDenial(clientOut, msg.ID, ErrCodeTaintViolation,
+					fmt.Sprintf("Conjoiner policy blocked egress: %s", reason),
+					UBMCPv1Error{
+						Code:           "CONJOINER_DENY_DRIFT",
+						ExitCode:       ExitCodePolicyDeny,
+						Retryable:      false,
+						Summary:        "Paused outbound egress tool call: sensitive session data or high-entropy secret detected.",
+						RemediationCmd: "conjoiner explain blast-radius --why",
+						Why:            "Conjoiner's dynamic taint gate prevents multi-step exfiltration of sensitive files read earlier in the session.",
+						ReceiptID:      sirID,
+					})
+				return nil, false
 			}
+		}
+
+		// 1c. Path Containment Validation (repo confinement against dot-dot & symlink escapes)
+		if err := s.validateArgumentPaths(params.Arguments); err != nil {
+			sirID := s.recordSIR(activeSessionID, params.Name, callDPoP, params.Arguments, ledger.VerdictDenyDrift, "path containment escape")
+			s.writeToolDenial(clientOut, msg.ID, ErrCodePolicyViolation,
+				fmt.Sprintf("Conjoiner policy blocked tool call: %v", err),
+				UBMCPv1Error{
+					Code:           "CONJOINER_PATH_CONTAINMENT_DENY",
+					ExitCode:       ExitCodePolicyDeny,
+					Retryable:      true,
+					Summary:        "Paused tool call: requested file path escapes the confined workspace root.",
+					RemediationCmd: "conjoiner gate confinement --root . --path <relative-path>",
+					Why:            "All MCP file paths must resolve strictly inside the canonical repository root without traversal or outside symlinks.",
+					ReceiptID:      sirID,
+				})
+			return nil, false
 		}
 
 		// 2. Monotonic scope attenuation check
@@ -784,9 +1273,20 @@ func (s *TransportShim) handleInboundLine(line []byte, _ io.Writer, clientOut io
 				}
 			}
 			if authErr != nil {
-				writeJSONRPCError(clientOut, msg.ID, ErrCodeScopeDenied,
-					fmt.Sprintf("Monotonic scope attenuation denied tool invocation: %v", authErr))
-				return false
+				sirID := s.recordSIR(activeSessionID, params.Name, callDPoP, params.Arguments, ledger.VerdictDenyScope, "workflow manifest denied scope")
+				safeTool := sanitizeSafeToolLabel(params.Name)
+				s.writeToolDenial(clientOut, msg.ID, ErrCodeScopeDenied,
+					fmt.Sprintf("Monotonic scope attenuation denied tool invocation: %v", authErr),
+					UBMCPv1Error{
+						Code:           "CONJOINER_DENY_SCOPE",
+						ExitCode:       ExitCodePolicyDeny,
+						Retryable:      false,
+						Summary:        fmt.Sprintf("Paused tool '%s': operation is outside the workflow manifest scope.", safeTool),
+						RemediationCmd: "conjoiner explain scope --why",
+						Why:            "Monotonic workflow attenuation blocks state-mutating or unpermitted operations outside the granted scope intersection.",
+						ReceiptID:      sirID,
+					})
+				return nil, false
 			}
 		}
 
@@ -801,13 +1301,35 @@ func (s *TransportShim) handleInboundLine(line []byte, _ io.Writer, clientOut io
 
 		if !authorized {
 			toolScope := fmt.Sprintf("tool:exec:%s", params.Name)
-			writeJSONRPCError(clientOut, msg.ID, ErrCodeScopeDenied,
-				fmt.Sprintf("Monotonic scope attenuation denied tool invocation: %s (required: %s)", params.Name, toolScope))
-			return false
+			sirID := s.recordSIR(activeSessionID, params.Name, callDPoP, params.Arguments, ledger.VerdictDenyScope, "monotonic scope attenuation denied")
+			safeTool := sanitizeSafeToolLabel(params.Name)
+			s.writeToolDenial(clientOut, msg.ID, ErrCodeScopeDenied,
+				fmt.Sprintf("Monotonic scope attenuation denied tool invocation: %s (required: %s)", params.Name, toolScope),
+				UBMCPv1Error{
+					Code:           "CONJOINER_DENY_SCOPE",
+					ExitCode:       ExitCodePolicyDeny,
+					Retryable:      false,
+					Summary:        fmt.Sprintf("Paused tool '%s': capability is outside granted monotonic scope.", safeTool),
+					RemediationCmd: "conjoiner explain scope --why",
+					Why:            "Subagent tool invocations require an explicit matching scope within the attenuated delegation chain.",
+					ReceiptID:      sirID,
+				})
+			return nil, false
 		}
+
+		// 3. Allowed tool call: record SignedIntentReceipt (ALLOW) and propagate FABRIAL_SESSION_ID + CONJOINER_SIR_ID
+		sirID := s.recordSIR(activeSessionID, params.Name, callDPoP, params.Arguments, ledger.VerdictAllow, "")
+		if idStr != "" && sirID != "" {
+			s.pendingMu.Lock()
+			s.pendingSIRID[idStr] = sirID
+			s.pendingMu.Unlock()
+		}
+
+		enriched := injectLineageIntoInboundFrame(trimmed, activeSessionID, sirID)
+		return enriched, true
 	}
 
-	return true
+	return trimmed, true
 }
 
 // pipeServerToClient processes outbound responses from MCP server to client IDE.
@@ -864,17 +1386,24 @@ func (s *TransportShim) handleOutboundLine(line []byte) []byte {
 	idStr := string(msg.ID)
 	var method string
 	var corrJTI string
+	var sirID string
 	if idStr != "" {
 		s.pendingMu.Lock()
 		method = s.pending[idStr]
 		corrJTI = s.pendingCorrelationJTI[idStr]
+		sirID = s.pendingSIRID[idStr]
 		delete(s.pending, idStr)
 		delete(s.pendingCorrelationJTI, idStr)
+		delete(s.pendingSIRID, idStr)
 		s.pendingMu.Unlock()
 	}
 	if corrJTI == "" {
-		corrJTI = s.activeCorrelationJTI
+		corrJTI = s.ActiveCorrelationJTI()
 	}
+	if sirID == "" {
+		sirID = s.LastSIRID()
+	}
+	sessID := s.resolveSessionID()
 
 	// 1. If response to tools/list, filter out unauthorized tools
 	if method == "tools/list" && len(msg.Result) > 0 {
@@ -897,15 +1426,23 @@ func (s *TransportShim) handleOutboundLine(line []byte) []byte {
 		}
 	}
 
-	// 2. Outbound trace header (X-Correlation-JTI) injection into _meta for result objects
-	if corrJTI != "" && len(msg.Result) > 0 && bytes.HasPrefix(bytes.TrimSpace(msg.Result), []byte("{")) {
+	// 2. Outbound trace & BLPR-v1 lineage header injection into _meta for result objects
+	if (corrJTI != "" || sessID != "" || sirID != "") && len(msg.Result) > 0 && bytes.HasPrefix(bytes.TrimSpace(msg.Result), []byte("{")) {
 		var resObj map[string]any
 		if err := json.Unmarshal(msg.Result, &resObj); err == nil {
 			metaMap, ok := resObj["_meta"].(map[string]any)
 			if !ok {
 				metaMap = make(map[string]any)
 			}
-			metaMap["X-Correlation-JTI"] = corrJTI
+			if corrJTI != "" {
+				metaMap["X-Correlation-JTI"] = corrJTI
+			}
+			if sessID != "" {
+				metaMap["FABRIAL_SESSION_ID"] = sessID
+			}
+			if sirID != "" {
+				metaMap["CONJOINER_SIR_ID"] = sirID
+			}
 			resObj["_meta"] = metaMap
 			if newResultBytes, err := json.Marshal(resObj); err == nil {
 				msg.Result = newResultBytes

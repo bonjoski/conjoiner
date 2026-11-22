@@ -18,3 +18,8 @@
 ## Key Sockets & Paths
 - Control Socket: `~/.conjoiner/conjoiner.sock`
 - Documentation: README.md & AGENTS.md
+
+
+## Paved-Road Integration (`2026-11-22`: In-App AI Blast-Radius & `UB-MCP-v1` SIR Lineage)
+- In-app AI blast-radius middleware (`pkg/aiboundary`): `BlastRadiusPolicy` (1-flip atomic `ReadOnlyKillSwitch`, per-request tool ceilings, deterministic RBAC scope & mutation bounds) + `conjoiner explain [topic] [--json]`
+- MCP shim (`pkg/mcp/shim.go`): Propagates `FABRIAL_SESSION_ID` + `CONJOINER_SIR_ID` (`SignedIntentReceipt.ReceiptID`) into downstream tools for `BLPR-v1` `parent_receipts` lineage, and returns `UB-MCP-v1` `structuredContent` (`exit_code: 10`) on DPoP/scope/path/taint denials.
