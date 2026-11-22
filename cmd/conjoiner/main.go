@@ -20,6 +20,7 @@ import (
 	"github.com/bonjoski/conjoiner/pkg/mcp"
 	"github.com/bonjoski/conjoiner/pkg/mcp/guard"
 	"github.com/bonjoski/conjoiner/pkg/token"
+	"github.com/bonjoski/conjoiner/pkg/ux"
 	"github.com/bonjoski/conjoiner/pkg/version"
 )
 
@@ -122,6 +123,10 @@ func main() {
 		handleMCPCommand(os.Args[2:])
 	case "mcp-shim", "mcp-proxy":
 		handleMCPShimCommand(os.Args[2:])
+	case "explain":
+		handleExplainCommand(os.Args[2:])
+	case "status":
+		handleStatusCommand(os.Args[2:])
 	case "version", "--version", "-v":
 		fmt.Printf("conjoiner version %s (Go NIST Agentic IAM Broker)\n", version.Version)
 		os.Exit(0)
@@ -129,8 +134,22 @@ func main() {
 		printUsage()
 		os.Exit(0)
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", os.Args[1])
-		printUsage()
+		showWhy := false
+		for _, a := range os.Args[2:] {
+			if a == "--why" {
+				showWhy = true
+			}
+		}
+		ffe := &ux.FixForwardError{
+			Tool:           "conjoiner",
+			Code:           "CONJOINER_UNKNOWN_COMMAND",
+			Summary:        fmt.Sprintf("Unknown command %q", os.Args[1]),
+			RemediationCmd: "conjoiner --help",
+			WhyOneLiner:    "Run `conjoiner explain dpop` or `conjoiner --help` to see available local commands.",
+			DeepWhy:        "Available commands: run, agentpass, token, dpop, gate, mandate, mcp, mcp-shim, explain, status, version, help.",
+			ExitCode:       1,
+		}
+		_ = ffe.Render(os.Stderr, false, showWhy)
 		os.Exit(1)
 	}
 }
@@ -170,6 +189,8 @@ Commands:
               --scrub-secrets              Enable Shield secret finding scrubbing on outbound tool output (default: true)
               --token <jwt>                Signed Conjoiner TaskToken JWT
               --scope <scopes>             Comma-separated allowed scopes
+  explain   Explain Conjoiner security concepts in UB-CLI-v2 format (dpop, scope, blast-radius, kill-switch, mcp) [--why] [--json]
+  status    Show local Conjoiner broker and aiboundary readiness status [--why] [--json]
   version   Display Conjoiner version`)
 }
 

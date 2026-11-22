@@ -53,9 +53,11 @@ Deterministic Policy Gateway
 ├── cmd/
 │   └── conjoiner/          # CLI entrypoint (token issue/attenuate/verify, gate exec)
 ├── pkg/
+│   ├── aiboundary/         # In-app AI blast-radius policy, HTTP/MCP adapters, 1-flip kill-switch & strict JSON guard
 │   ├── attenuation/        # Scope parsing, subset validation, delegation envelopes
 │   ├── gateway/            # Deterministic policy gateway & tool executors
-│   └── token/              # RFC 8693 Token Exchange, RFC 9449 DPoP & replay cache
+│   ├── token/              # RFC 8693 Token Exchange, RFC 9449 DPoP & replay cache
+│   └── ux/                 # UB-CLI-v2 Fix-Forward error renderer & ANSI/shell sanitizer
 ├── go.mod
 └── README.md
 ```
@@ -119,6 +121,8 @@ Every primary developer use case is backed by dedicated, copy-pasteable recipes 
 | **Path-Restricted Attenuation** | Monotonically restrict subagent write capabilities to a subfolder:<br/>`conjoiner token attenuate --token "$PARENT" --restrict-path "./src/components"` | [Guide](docs/use-cases/02-path-restricted-attenuation.md) |
 | **Cryptographic Intent Ledger** | Maintain and verify an immutable Merkle audit trail of all subagent actions:<br/>`conjoiner audit --verify` | [Guide](docs/use-cases/03-cryptographic-intent-ledger.md) |
 | **MCP Repo-Confinement & Inode Pinning** | Prevent traversal & symlink escapes in tool calls (`write_file`/`edit_file`):<br/>`conjoiner gate confinement --root "$PWD" --path "$TARGET"` | [RFC-42](https://github.com/bonjoski/spanreed/blob/main/docs/plans/accepted/2026-11-19-mcp-repo-confinement-and-keystore-frame-integrity-rfc.md) |
+| **In-App AI Blast-Radius Middleware** | Embed deterministic HTTP/MCP adapters (`WrapHTTPHandler`, `WrapMCPToolCall`), strict JSON decoding & 1-flip read-only kill-switches outside the LLM loop (`pkg/aiboundary`):<br/>`go test -race ./pkg/aiboundary/...` | [Guide](docs/use-cases/02-in-app-ai-blast-radius-middleware.md) |
+| **UB-CLI-v2 Concept Explainers** | Progressive-disclosure local architecture explainers (`dpop`, `scope`, `blast-radius`, `kill-switch`, `mcp`):<br/>`conjoiner explain blast-radius --why` | [Guide](docs/use-cases/02-in-app-ai-blast-radius-middleware.md) |
 
 ### Securing Model Context Protocol (MCP) Tool Calls with Inode Confinement
 
