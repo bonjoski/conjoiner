@@ -8,9 +8,9 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/bonjoski/conjoiner/internal/aiprovider"
+	"github.com/bonjoski/conjoiner/internal/redact"
 	"github.com/bonjoski/conjoiner/pkg/attenuation"
-	"github.com/bonjoski/shield/pkg/provider"
-	"github.com/bonjoski/shield/pkg/shield"
 )
 
 var (
@@ -101,12 +101,15 @@ func Compile(ctx context.Context, instruction string, useAI bool) (*Result, erro
 	var advisory string
 
 	if useAI {
-		// 1. Redact candidate prompt using Shield to guarantee credential confidentiality
-		engine := shield.NewEngine(shield.DefaultConfig())
+		// 1. Redact candidate prompt locally to guarantee credential confidentiality
+		engine := redact.NewEngine(redact.DefaultConfig())
 		prompt := fmt.Sprintf("Translate this security mandate into Conjoiner capability scopes (format: <domain>:<action>:<resource>):\n%s", trimmed)
-		redacted, _, err := engine.Redact(prompt)
+		redacted, tm, err := engine.Redact(prompt)
+		if tm != nil {
+			defer tm.Zeroize()
+		}
 		if err != nil {
-			return nil, fmt.Errorf("failed shielding mandate prompt: %w", err)
+			return nil, fmt.Errorf("failed redacting mandate prompt: %w", err)
 		}
 
 		// 2. Enforce fail-closed wire guard
@@ -115,11 +118,11 @@ func Compile(ctx context.Context, instruction string, useAI bool) (*Result, erro
 		}
 
 		// 3. Complete with AI provider
-		prov := provider.NewFromEnv()
-		resp, err := prov.Complete(ctx, provider.Request{
+		prov := aiprovider.NewFromEnv()
+		resp, err := prov.Complete(ctx, aiprovider.Request{
 			Model: "auto",
-			Messages: []provider.Message{
-				{Role: provider.RoleUser, Content: redacted},
+			Messages: []aiprovider.Message{
+				{Role: aiprovider.RoleUser, Content: redacted},
 			},
 		})
 		if err != nil {

@@ -77,3 +77,46 @@ func TestCNJ05_CompileWithCeilingEnforcesIntersection(t *testing.T) {
 		t.Fatalf("CNJ-05 FAILED: ceiling intersection allowed out-of-bounds scopes: %v", res.Scopes)
 	}
 }
+
+// TestAdversarial_MandateAIRedactionZeroSecretLeakage verifies Unicode-smuggled and high-entropy
+// secrets embedded in mandate instructions never leak through AI-assisted compilation.
+func TestAdversarial_MandateAIRedactionZeroSecretLeakage(t *testing.T) {
+	secrets := []struct {
+		name   string
+		sample string
+		needle string
+	}{
+		{
+			name:   "UnicodeSmuggledAWSKey",
+			sample: "Allow reading /workspace with AKIA\u00ad\ufe0f\U000e0061IOSFODNN7EXAMPLE",
+			needle: "IOSFODNN7EXAMPLE",
+		},
+		{
+			name:   "HighEntropyToken",
+			sample: "Allow reading /workspace using k9J2m!xQ8$vP4zL7*wR1tY6#bN3cV5mZ",
+			needle: "k9J2m!xQ8$vP4zL7*wR1tY6#bN3cV5mZ",
+		},
+		{
+			name:   "AnthropicAPIKey",
+			sample: "Allow reading /workspace using sk-" + "ant-api03-abcdefghijklmnopqrstuvwxyz1234567890",
+			needle: "sk-" + "ant-api03",
+		},
+	}
+
+	for _, tc := range secrets {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := Compile(context.Background(), tc.sample, true)
+			if err != nil {
+				t.Fatalf("Compile with AI failed for %s: %v", tc.name, err)
+			}
+			if strings.Contains(res.Advisory, tc.needle) {
+				t.Fatalf("secret needle %q leaked into AI advisory: %s", tc.needle, res.Advisory)
+			}
+			for _, sc := range res.Scopes {
+				if strings.Contains(sc, tc.needle) {
+					t.Fatalf("secret needle %q leaked into compiled scopes: %v", tc.needle, res.Scopes)
+				}
+			}
+		})
+	}
+}

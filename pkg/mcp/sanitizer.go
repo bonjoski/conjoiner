@@ -9,7 +9,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/bonjoski/shield/pkg/shield"
+	"github.com/bonjoski/conjoiner/internal/redact"
 )
 
 // Regex signatures for prompt injection, jailbreaks, system prompt overrides, and unauthorized reflection.
@@ -29,19 +29,19 @@ var (
 
 // Sanitizer provides semantic input screening and secret redaction.
 type Sanitizer struct {
-	shieldEngine *shield.Engine
+	redactEngine *redact.Engine
 }
 
 // NewSanitizer constructs an active sanitizer enriched with vendor patterns.
 func NewSanitizer() *Sanitizer {
-	cfg := shield.DefaultConfig()
-	// Enrich built-in shield patterns with GitLab personal access tokens
-	cfg.Patterns = append(cfg.Patterns, shield.SecretPattern{
+	cfg := redact.DefaultConfig()
+	// Enrich built-in redaction patterns with GitLab personal access tokens
+	cfg.Patterns = append(cfg.Patterns, redact.SecretPattern{
 		Name:  "GitLab Personal Access Token",
 		Regex: regexp.MustCompile(`\bglpat-[0-9a-zA-Z_\-]{20,}\b`),
 	})
 	return &Sanitizer{
-		shieldEngine: shield.NewEngine(cfg),
+		redactEngine: redact.NewEngine(cfg),
 	}
 }
 
@@ -172,9 +172,12 @@ func (s *Sanitizer) scrubText(text string) (string, bool) {
 		}
 	}
 
-	// 2. Pass through Shield engine (handles high entropy tokens, known keys, and standard patterns with [SECRET_REF_...])
-	if s.shieldEngine != nil {
-		redacted, tm, err := s.shieldEngine.Redact(text)
+	// 2. Pass through local redaction engine (handles high entropy tokens, known keys, and standard patterns with [SECRET_REF_...])
+	if s.redactEngine != nil {
+		redacted, tm, err := s.redactEngine.Redact(text)
+		if tm != nil {
+			defer tm.Zeroize()
+		}
 		if err == nil && tm != nil && tm.Count() > 0 {
 			text = redacted
 			modified = true
