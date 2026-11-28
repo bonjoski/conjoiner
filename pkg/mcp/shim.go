@@ -37,6 +37,7 @@ var (
 )
 
 var sensitiveEnvPrefixes = []string{
+	"AIRLOCK_CANARY_",
 	"CONJOINER_",
 	"AWS_",
 	"AZURE_",
@@ -139,6 +140,8 @@ type Config struct {
 	DPoPReplayCache         token.ReplayCache
 	DPoPMaxSkew             time.Duration
 	UBMCPv1Errors           bool
+	CanaryManifestPath      string
+	ArgusSocketPath         string
 }
 
 // TransportShim coordinates bidirectional streaming JSON-RPC inspection.
@@ -153,6 +156,7 @@ type TransportShim struct {
 	activeCorrelationJTI  string
 	pendingCorrelationJTI map[string]string
 	sanitizer             *Sanitizer
+	canaryGuard           *CanaryGuard
 	taintGate             TaintGate
 	nonceTracker          *token.SessionNonceTracker
 	ledger                ledger.Ledger
@@ -348,6 +352,19 @@ func NewTransportShim(cfg Config) (*TransportShim, error) {
 
 	ubMCPv1 := cfg.UBMCPv1Errors || cfg.Ledger != nil || wsRoot != "" || cfg.RequireDPoP
 
+	manifestPath := strings.TrimSpace(cfg.CanaryManifestPath)
+	if manifestPath == "" {
+		manifestPath = strings.TrimSpace(os.Getenv(EnvAirlockCanaryManifest))
+	}
+	var canaryGuard *CanaryGuard
+	if manifestPath != "" {
+		loadedGuard, err := LoadCanaryGuard(manifestPath, cfg.ArgusSocketPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed loading canary manifest: %w", err)
+		}
+		canaryGuard = loadedGuard
+	}
+
 	return &TransportShim{
 		cfg:                   cfg,
 		scopeSet:              scopeSet,
@@ -359,6 +376,7 @@ func NewTransportShim(cfg Config) (*TransportShim, error) {
 		activeCorrelationJTI:  corrJTI,
 		pendingCorrelationJTI: make(map[string]string),
 		sanitizer:             NewSanitizer(),
+		canaryGuard:           canaryGuard,
 		taintGate:             tg,
 		nonceTracker:          nonceTracker,
 		ledger:                cfg.Ledger,
@@ -1196,6 +1214,37 @@ func (s *TransportShim) processInboundLine(line []byte, clientOut io.Writer) ([]
 						Summary:        "Paused tool call: prompt-injection or unauthorized reflection pattern detected in arguments.",
 						RemediationCmd: "conjoiner explain mcp --why",
 						Why:            "Untrusted tool arguments containing instruction overrides or role tags are blocked fail-closed.",
+						ReceiptID:      sirID,
+					})
+				return nil, false
+			}
+		}
+
+		// 1a. Decoupled Airlock Canary Tripwire Scan (RFC-2026-11-27-69):
+		// Inspect outbound MCP JSON-RPC tool name and arguments before forwarding.
+		if s.canaryGuard != nil {
+			var hit CanaryMatch
+			matched := false
+			if m, ok := s.canaryGuard.Match([]byte(params.Name)); ok {
+				hit, matched = m, true
+			} else if len(params.Arguments) > 0 {
+				if m, ok := s.canaryGuard.MatchJSON(params.Arguments); ok {
+					hit, matched = m, true
+				}
+			}
+			if matched {
+				s.canaryGuard.EmitArgusAlert(hit, params.Name)
+				reason := fmt.Sprintf("canary tripwire triggered (canary_id=%s kind=%s sha256=%s)", hit.CanaryID, hit.Kind, hit.ValueSHA256)
+				sirID := s.recordSIR(activeSessionID, params.Name, callDPoP, params.Arguments, ledger.VerdictDenyDrift, reason)
+				s.writeToolDenial(clientOut, msg.ID, ErrCodeTaintViolation,
+					"Conjoiner policy blocked tool call: "+reason,
+					UBMCPv1Error{
+						Code:           "CONJOINER_CANARY_TRIPWIRE",
+						ExitCode:       ExitCodePolicyDeny,
+						Retryable:      false,
+						Summary:        "Halted tool call: Airlock session canary tripwire triggered in MCP arguments.",
+						RemediationCmd: "conjoiner explain blast-radius --why",
+						Why:            "A decoy credential planted inside the sandboxed virtual HOME appeared in an outbound MCP tool call.",
 						ReceiptID:      sirID,
 					})
 				return nil, false
